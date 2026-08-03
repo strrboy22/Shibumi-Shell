@@ -169,7 +169,8 @@ scan_wallpapers() {
   [[ $theme_name =~ ^[A-Za-z0-9._-]+$ ]] || theme_name=""
   for root in \
     "$HOME/.local/state/omarchy/current/theme/backgrounds" \
-    "$HOME/.config/omarchy/backgrounds/$theme_name"; do
+    "$HOME/.config/omarchy/backgrounds/$theme_name" \
+    "$HOME/Wallpapers" ; do
     [[ -d $root ]] || continue
     while IFS= read -r -d '' source; do
       emit_row wallpaper "$source" "${source##*/}" "$root"

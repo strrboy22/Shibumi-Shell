@@ -465,7 +465,9 @@ Item {
             "omarchy-theme-set", entry.label])) return false
     } else if (mode === "wallpaper") {
       if (!startSelectionAction("wallpaper", entry.label || entry.sourcePath,
-          ["omarchy-theme-bg-set", entry.sourcePath])) return false
+          ["bash", "-c",
+            "aether --generate \"$1\" && omarchy-theme-bg-set \"$1\"",
+            "shibumi-wallpaper", entry.sourcePath])) return false
     } else {
       Quickshell.execDetached(["xdg-open", entry.sourcePath])
       close()

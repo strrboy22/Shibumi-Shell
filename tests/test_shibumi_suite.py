@@ -7,6 +7,7 @@ import json
 import io
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -30,6 +31,7 @@ from shibumi_suite.cli import (  # noqa: E402
     command_uninstall,
     command_update,
     load_install_state,
+    version_key,
 )
 from shibumi_suite.config import (  # noqa: E402
     ConfigError,
@@ -52,10 +54,26 @@ from shibumi_suite.menu_extension import (  # noqa: E402
     remove_picker_routing,
 )
 from shibumi_suite.runtime import OmarchyRuntime, RuntimeFailure, RuntimePaths  # noqa: E402
+import shibumi_suite.transaction as transaction_module  # noqa: E402
 from shibumi_suite.transaction import (  # noqa: E402
     PluginTransaction,
     TransactionError,
     recover_transactions,
+)
+
+
+QUICKSHELL_EMPTY_REGISTRY = "No running instances.\n"
+INVALID_EMPTY_REGISTRY_OUTPUTS = (
+    "",
+    "No running instances.",
+    " No running instances.\n",
+    "No running instances. \n",
+    "No running instances.\r\n",
+    "No running instances.\nextra",
+    "prefix No running instances.\n",
+    "{}",
+    "null",
+    "not-json\n",
 )
 
 
@@ -75,6 +93,9 @@ class FakeOmarchyRuntime(OmarchyRuntime):
         self.fail_payload_reload = False
         self.fail_deactivation_verify = False
         self.menu_refreshes = 0
+        self.shell_running = True
+        self.restart_failure_stops_shell = False
+        self.events: list[str] = []
 
     def validate_plugin(self, directory: Path) -> None:
         manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
@@ -86,6 +107,7 @@ class FakeOmarchyRuntime(OmarchyRuntime):
             raise RuntimeFailure(f"invalid staged plugin {directory}")
 
     def rescan(self) -> None:
+        self.events.append("rescan")
         self.rescans += 1
         if self.rescans in self.fail_rescan_calls:
             raise RuntimeFailure("injected rescan failure")
@@ -94,18 +116,26 @@ class FakeOmarchyRuntime(OmarchyRuntime):
             raise RuntimeFailure("injected rescan failure")
 
     def reload_config(self) -> None:
+        self.events.append("reload-config")
         self.reloads += 1
 
     def restart_shell(self) -> None:
+        self.events.append("restart")
         self.restarts += 1
         if self.fail_restart_count:
             self.fail_restart_count -= 1
+            if self.restart_failure_stops_shell:
+                self.shell_running = False
             raise RuntimeFailure("injected shell restart failure")
+        self.shell_running = True
 
     def stop_shell(self) -> None:
+        self.events.append("stop")
         self.stops += 1
+        self.shell_running = False
 
     def reload_payload(self) -> None:
+        self.events.append("reload-payload")
         self.payload_reloads += 1
         if self.fail_payload_reload:
             raise RuntimeFailure("injected payload reload failure")
@@ -114,10 +144,12 @@ class FakeOmarchyRuntime(OmarchyRuntime):
         self.menu_refreshes += 1
 
     def ping(self) -> None:
-        return
+        if not self.shell_running:
+            raise RuntimeFailure("injected shell is not running")
 
     def verify_single_shell_instance(self) -> None:
-        return
+        if not self.shell_running:
+            raise RuntimeFailure("injected shell is not running")
 
     def verify_bar_layer_ownership(self, expected_namespace: str) -> None:
         return
@@ -218,8 +250,10 @@ class RuntimeProcessTests(unittest.TestCase):
         self.temporary.cleanup()
 
     @staticmethod
-    def result(stdout: str = "", returncode: int = 0) -> SimpleNamespace:
-        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
+    def result(
+        stdout: str = "", returncode: int = 0, stderr: str = ""
+    ) -> SimpleNamespace:
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
     def instance_json(self, *paths: Path) -> str:
         return json.dumps([
@@ -268,13 +302,12 @@ class RuntimeProcessTests(unittest.TestCase):
         config = self.omarchy_root / "shell/shell.qml"
         foreign = Path(self.temporary.name) / "foreign/shell.qml"
         self.runtime.run = Mock(side_effect=[
-            self.result(),
             self.result(self.instance_json(config, foreign)),
             self.result(),
             self.result(self.instance_json(foreign)),
         ])
 
-        self.runtime.stop_shell()
+        self.runtime.stop_shell(quiet_period=0)
 
         commands = [call.args[0] for call in self.runtime.run.call_args_list]
         kill = [
@@ -284,7 +317,63 @@ class RuntimeProcessTests(unittest.TestCase):
             str(self.omarchy_root / "shell"),
             "--any-display",
         ]
-        self.assertEqual(commands.count(kill), 2)
+        registry = ["quickshell", "list", "--all", "--json"]
+        self.assertEqual(commands, [registry, kill, registry])
+
+    def test_empty_quickshell_registry_sentinel_is_an_empty_array(self) -> None:
+        self.runtime.run = Mock(return_value=self.result(
+            QUICKSHELL_EMPTY_REGISTRY
+        ))
+        self.assertEqual(self.runtime.quickshell_instances(), [])
+
+    def test_empty_registry_sentinel_with_nonzero_exit_fails_closed(self) -> None:
+        command = ["quickshell", "list", "--all", "--json"]
+        completed = subprocess.CompletedProcess(
+            command,
+            23,
+            stdout=QUICKSHELL_EMPTY_REGISTRY,
+            stderr="registry unavailable",
+        )
+        globals_map = OmarchyRuntime.run.__globals__
+        with patch.object(
+            globals_map["subprocess"], "run", return_value=completed
+        ):
+            with self.assertRaisesRegex(RuntimeFailure, r"failed \(23\)"):
+                self.runtime.quickshell_instances()
+
+    def test_empty_registry_sentinel_timeout_fails_closed(self) -> None:
+        command = ["quickshell", "list", "--all", "--json"]
+        timeout = subprocess.TimeoutExpired(
+            command,
+            0.01,
+            output=QUICKSHELL_EMPTY_REGISTRY,
+        )
+        globals_map = OmarchyRuntime.run.__globals__
+        with patch.object(
+            globals_map["subprocess"], "run", side_effect=timeout
+        ):
+            with self.assertRaisesRegex(RuntimeFailure, "cannot run quickshell list"):
+                self.runtime.quickshell_instances(timeout=0.01)
+
+    def test_quickshell_registry_json_arrays_remain_supported(self) -> None:
+        instance = {"config_path": "/tmp/shell.qml", "pid": 4242}
+        for stdout, expected in (
+            ("[]", []),
+            (json.dumps([instance]), [instance]),
+        ):
+            with self.subTest(stdout=stdout):
+                self.runtime.run = Mock(return_value=self.result(stdout))
+                self.assertEqual(self.runtime.quickshell_instances(), expected)
+
+    def test_empty_registry_sentinel_variants_fail_closed(self) -> None:
+        for stdout in INVALID_EMPTY_REGISTRY_OUTPUTS:
+            with self.subTest(stdout=stdout):
+                self.runtime.run = Mock(return_value=self.result(stdout))
+                with self.assertRaisesRegex(
+                    RuntimeFailure,
+                    "malformed instance JSON|not an array",
+                ):
+                    self.runtime.quickshell_instances()
 
     def test_layer_guard_rejects_stock_and_shibumi_bars_together(self) -> None:
         layers = {
@@ -716,8 +805,8 @@ class SuiteLifecycleTests(unittest.TestCase):
         state = load_install_state(self.paths, suite)
         self.assertEqual(state["installOrigin"], "package")
         self.assertEqual(state["packageName"], "shibumi-shell")
-        self.assertEqual(state["packageVersion"], "0.1.1-beta.4")
-        self.assertEqual(state["sourceRevision"], "package:0.1.1-beta.4")
+        self.assertEqual(state["packageVersion"], "0.1.1-beta.7")
+        self.assertEqual(state["sourceRevision"], "package:0.1.1-beta.7")
         self.assertNotIn("sourceRoot", state)
         self.assertEqual(state["payloadRoot"], str(self.source.resolve()))
 
@@ -736,7 +825,7 @@ class SuiteLifecycleTests(unittest.TestCase):
         package_state = load_install_state(self.paths, suite)
         self.assertEqual(package_state["installOrigin"], "package")
         self.assertEqual(package_state["packageName"], "shibumi-shell")
-        self.assertEqual(package_state["packageVersion"], "0.1.1-beta.4")
+        self.assertEqual(package_state["packageVersion"], "0.1.1-beta.7")
         self.assertNotIn("sourceRoot", package_state)
 
     def test_update_transactionally_retires_app_menu(self) -> None:
@@ -777,6 +866,42 @@ class SuiteLifecycleTests(unittest.TestCase):
             (self.paths.state_dir / "install.json").read_bytes(), state_before
         )
         self.assertEqual(self.paths.config_file.read_bytes(), config_before)
+
+    def test_update_and_repair_accept_semver_build_metadata(self) -> None:
+        self.install()
+        state_path = self.paths.state_dir / "install.json"
+        for operation in (command_update, command_repair):
+            with self.subTest(operation=operation.__name__):
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                state["suiteVersion"] = "0.1.1-beta.7+installed.7"
+                state_path.write_text(
+                    json.dumps(state, indent=2) + "\n", encoding="utf-8"
+                )
+                self.assertEqual(
+                    operation(self.args(), self.suite, self.paths, self.runtime),
+                    0,
+                )
+                updated = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertEqual(updated["suiteVersion"], "0.1.1-beta.7")
+
+        self.assertEqual(
+            version_key("1.0.0+build.7"),
+            version_key("1.0.0+build.8"),
+        )
+        self.assertLess(
+            version_key("1.0.0-rc.1+build.9"),
+            version_key("1.0.0"),
+        )
+        for invalid in (
+            "1.2",
+            "01.2.3",
+            "1.2.3-alpha..1",
+            "1.2.3-01",
+            "1.2.3+",
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(CliError, "unsupported Shibumi version"):
+                    version_key(invalid)
 
     def test_update_refuses_package_downgrade_without_mutation(self) -> None:
         suite = self.packaged_suite()
@@ -820,9 +945,9 @@ class SuiteLifecycleTests(unittest.TestCase):
         )
 
         rolled_back = load_install_state(self.paths, suite)
-        self.assertEqual(rolled_back["suiteVersion"], "0.1.1-beta.4")
-        self.assertEqual(rolled_back["packageVersion"], "0.1.1-beta.4")
-        self.assertEqual(rolled_back["sourceRevision"], "package:0.1.1-beta.4")
+        self.assertEqual(rolled_back["suiteVersion"], "0.1.1-beta.7")
+        self.assertEqual(rolled_back["packageVersion"], "0.1.1-beta.7")
+        self.assertEqual(rolled_back["sourceRevision"], "package:0.1.1-beta.7")
 
     def test_rescan_uses_shell_ipc_contract(self) -> None:
         runtime = OmarchyRuntime()
@@ -1235,6 +1360,69 @@ class SuiteLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(restored["bar"], defaults["bar"])
 
+    def test_failed_first_external_install_skips_absent_payload_provider(self) -> None:
+        base = json.loads(self.defaults.read_text(encoding="utf-8"))
+        base["bar"]["id"] = "third.party.bar"
+        atomic_write(self.paths.config_file, encode_config(base))
+        original_config = self.paths.config_file.read_bytes()
+        reloads_before = self.runtime.payload_reloads
+        with patch.object(
+            self.runtime,
+            "verify_update",
+            side_effect=RuntimeFailure("injected first external verification failure"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeFailure, "injected first external verification failure"
+            ):
+                command_install(
+                    self.args(no_activate=True, keep_layout=True),
+                    self.suite,
+                    self.paths,
+                    self.runtime,
+                )
+
+        self.assertEqual(self.paths.config_file.read_bytes(), original_config)
+        self.assertEqual(self.runtime.payload_reloads, reloads_before)
+        self.assertTrue(self.runtime.shell_running)
+        self.assertFalse(
+            (self.paths.plugin_dir / "hancore.shibumi.state").exists()
+        )
+        self.assertFalse(self.hidden_transaction_paths())
+
+    def test_external_drift_rollback_skips_disabled_payload_provider(self) -> None:
+        external_args = self.args(no_activate=True, keep_layout=True)
+        self.assertEqual(
+            command_install(external_args, self.suite, self.paths, self.runtime), 0
+        )
+        config = json.loads(self.paths.config_file.read_text(encoding="utf-8"))
+        config["plugins"] = [
+            entry for entry in config.get("plugins", [])
+            if entry_id(entry) != "hancore.shibumi.state"
+        ]
+        atomic_write(self.paths.config_file, encode_config(config))
+        original_config = self.paths.config_file.read_bytes()
+        reloads_before = self.runtime.payload_reloads
+
+        with patch.object(
+            self.runtime,
+            "verify_update",
+            side_effect=RuntimeFailure("injected external drift verification failure"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeFailure, "injected external drift verification failure"
+            ):
+                command_repair(self.args(), self.suite, self.paths, self.runtime)
+
+        self.assertEqual(self.paths.config_file.read_bytes(), original_config)
+        # The attempted external repair performs one payload reload while the
+        # provider is enabled; rollback must not issue a second call after the
+        # restored drift configuration unloads it.
+        self.assertEqual(self.runtime.payload_reloads, reloads_before + 1)
+        self.assertTrue(
+            (self.paths.plugin_dir / "hancore.shibumi.state").is_dir()
+        )
+        self.assertFalse(self.hidden_transaction_paths())
+
     def test_external_install_update_repair_and_activate_preserve_host_layout(
         self,
     ) -> None:
@@ -1430,6 +1618,43 @@ class SuiteLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(command_status(self.suite, self.paths), 0)
 
+    def test_managed_repair_stops_before_publish_and_restarts_once(self) -> None:
+        self.install()
+        plugin_id = "hancore.shibumi.bluetooth"
+        shutil.rmtree(self.paths.plugin_dir / plugin_id)
+        config = json.loads(self.paths.config_file.read_text(encoding="utf-8"))
+        config["bar"].pop("id", None)
+        config["bar"]["layout"] = {
+            "left": [{"id": "omarchy.menu"}],
+            "center": [{"id": "omarchy.clock"}],
+            "right": [],
+        }
+        atomic_write(self.paths.config_file, encode_config(config))
+
+        original_expose = PluginTransaction.expose
+
+        def recording_expose(transaction: PluginTransaction) -> None:
+            self.runtime.events.append("expose")
+            original_expose(transaction)
+
+        self.runtime.events.clear()
+        with patch.object(PluginTransaction, "expose", recording_expose):
+            self.assertEqual(
+                command_repair(self.args(), self.suite, self.paths, self.runtime),
+                0,
+            )
+
+        self.assertIn("stop", self.runtime.events)
+        self.assertIn("expose", self.runtime.events)
+        self.assertLess(
+            self.runtime.events.index("stop"), self.runtime.events.index("expose")
+        )
+        self.assertEqual(self.runtime.events.count("restart"), 1)
+        self.assertNotIn("reload-config", self.runtime.events)
+        self.assertNotIn("reload-payload", self.runtime.events)
+        self.assertTrue((self.paths.plugin_dir / plugin_id).is_dir())
+        self.assertEqual(command_status(self.suite, self.paths), 0)
+
     def test_repair_restores_plugin_removed_by_generic_plugin_manager(self) -> None:
         self.install()
         state_before = load_install_state(self.paths, self.suite)
@@ -1472,7 +1697,7 @@ class SuiteLifecycleTests(unittest.TestCase):
         shutil.rmtree(target)
         original_config = self.paths.config_file.read_bytes()
         original_state = (self.paths.state_dir / "install.json").read_bytes()
-        self.runtime.fail_payload_reload = True
+        self.runtime.fail_restart_count = 1
 
         with self.assertRaises(RuntimeFailure):
             command_repair(self.args(), self.suite, self.paths, self.runtime)
@@ -1483,6 +1708,73 @@ class SuiteLifecycleTests(unittest.TestCase):
             (self.paths.state_dir / "install.json").read_bytes(),
             original_state,
         )
+        self.assertFalse(self.hidden_transaction_paths())
+
+    def test_started_repair_uses_live_fallback_when_rollback_restart_is_blocked(self) -> None:
+        self.install()
+        original_config = self.paths.config_file.read_bytes()
+        original_state = (self.paths.state_dir / "install.json").read_bytes()
+        reloads_before = self.runtime.reloads
+        original_restart = self.runtime.restart_shell
+        restart_calls = 0
+
+        def fail_second_restart() -> None:
+            nonlocal restart_calls
+            restart_calls += 1
+            if restart_calls == 2:
+                raise RuntimeFailure("injected rollback restart preflight failure")
+            original_restart()
+
+        with patch.object(
+            self.runtime, "restart_shell", side_effect=fail_second_restart
+        ), patch.object(
+            self.runtime,
+            "verify_install",
+            side_effect=RuntimeFailure("injected post-restart verification failure"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeFailure, "injected post-restart verification failure"
+            ):
+                command_repair(self.args(), self.suite, self.paths, self.runtime)
+
+        self.assertEqual(restart_calls, 2)
+        self.assertTrue(self.runtime.shell_running)
+        self.assertGreater(self.runtime.reloads, reloads_before)
+        self.assertEqual(self.paths.config_file.read_bytes(), original_config)
+        self.assertEqual(
+            (self.paths.state_dir / "install.json").read_bytes(), original_state
+        )
+        self.assertFalse(self.hidden_transaction_paths())
+
+    def test_stopped_repair_retains_recovery_when_restart_remains_blocked(self) -> None:
+        self.install()
+        plugin_id = "hancore.shibumi.bluetooth"
+        target = self.paths.plugin_dir / plugin_id
+        shutil.rmtree(target)
+        original_config = self.paths.config_file.read_bytes()
+        original_state = (self.paths.state_dir / "install.json").read_bytes()
+        self.runtime.fail_restart_count = 2
+
+        with self.assertRaisesRegex(RuntimeFailure, "injected shell restart failure"):
+            command_repair(self.args(), self.suite, self.paths, self.runtime)
+
+        self.assertFalse(self.runtime.shell_running)
+        self.assertFalse(target.exists())
+        self.assertEqual(self.paths.config_file.read_bytes(), original_config)
+        self.assertEqual(
+            (self.paths.state_dir / "install.json").read_bytes(), original_state
+        )
+        transactions = list(
+            (self.paths.state_dir / "transactions").glob("*/journal.json")
+        )
+        self.assertEqual(len(transactions), 1)
+        journal = json.loads(transactions[0].read_text(encoding="utf-8"))
+        self.assertEqual(journal["phase"], "recovery-required")
+        self.assertTrue(journal["shellStopped"])
+
+        self.assertEqual(recover_transactions(self.paths, self.runtime), 1)
+        self.assertTrue(self.runtime.shell_running)
+        self.assertFalse(target.exists())
         self.assertFalse(self.hidden_transaction_paths())
 
     def test_repair_removes_suite_helper_enabled_as_a_generic_widget(self) -> None:
@@ -1638,7 +1930,11 @@ class SuiteLifecycleTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.suite = Suite.load(self.source)
-        self.runtime.fail_restart_count = 1
+        stops_before = self.runtime.stops
+        reloads_before = self.runtime.payload_reloads
+        # The operational restart and rollback restart both fail their host
+        # preflight before killing the still-running shell.
+        self.runtime.fail_restart_count = 2
         with self.assertRaisesRegex(
             RuntimeFailure, "injected shell restart failure"
         ):
@@ -1646,6 +1942,8 @@ class SuiteLifecycleTests(unittest.TestCase):
         self.assertEqual(target_file.read_bytes(), old_payload)
         self.assertEqual(self.paths.config_file.read_bytes(), old_config)
         self.assertEqual((self.paths.state_dir / "install.json").read_bytes(), old_state)
+        self.assertEqual(self.runtime.stops, stops_before)
+        self.assertGreater(self.runtime.payload_reloads, reloads_before)
         self.assertFalse(self.hidden_transaction_paths())
         self.assertFalse((self.paths.state_dir / "transactions").exists())
 
@@ -1745,6 +2043,680 @@ class SuiteLifecycleTests(unittest.TestCase):
         self.assertEqual(config["bar"]["id"], "hancore.shibumi.bar")
         self.assertFalse(self.hidden_transaction_paths())
 
+    def test_first_transaction_durably_creates_recovery_namespace(self) -> None:
+        plugin_id = "hancore.shibumi.memory"
+        target = self.paths.plugin_dir / plugin_id
+        target.mkdir(parents=True)
+        (target / ".shibumi-managed.json").write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "suiteId": "hancore.shibumi",
+                    "pluginId": plugin_id,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        transaction_root = self.paths.state_dir / "transactions"
+        events: list[tuple[str, Path]] = []
+        original_fsync_directory = transaction_module._fsync_directory
+        original_replace = transaction_module.os.replace
+        original_write_journal = PluginTransaction._write_journal
+
+        def recording_fsync_directory(path: Path) -> None:
+            original_fsync_directory(path)
+            events.append(("fsync", path))
+
+        def recording_replace(source: object, destination: object) -> None:
+            original_replace(source, destination)
+            source_path = Path(source)
+            destination_path = Path(destination)
+            if (
+                source_path.name.startswith(transaction_module.PREPARATION_PREFIX)
+                and destination_path.parent == transaction_root
+            ):
+                events.append(("publish", destination_path))
+            elif destination_path.name.startswith(".shibumi-backup."):
+                events.append(("mutation", destination_path))
+
+        def recording_write_journal(
+            transaction: PluginTransaction, *args: object, **kwargs: object
+        ) -> None:
+            original_write_journal(transaction, *args, **kwargs)
+            phase = str(args[0] if args else kwargs.get("phase") or "")
+            events.append((f"journal:{phase}", transaction.journal_file))
+
+        with (
+            patch.object(
+                transaction_module,
+                "_fsync_directory",
+                side_effect=recording_fsync_directory,
+            ),
+            patch.object(
+                transaction_module.os,
+                "replace",
+                side_effect=recording_replace,
+            ),
+            patch.object(
+                PluginTransaction,
+                "_write_journal",
+                recording_write_journal,
+            ),
+        ):
+            transaction = PluginTransaction(self.paths, self.runtime)
+            transaction.stage_removal_ids((plugin_id,))
+
+        first_journal = next(
+            index
+            for index, event in enumerate(events)
+            if event[0] == "journal:prepared"
+        )
+        for required in (
+            self.paths.state_dir.parent,
+            self.paths.state_dir,
+            transaction_root,
+        ):
+            sync_index = events.index(("fsync", required))
+            self.assertLess(sync_index, first_journal)
+        publish_index = next(
+            index for index, event in enumerate(events) if event[0] == "publish"
+        )
+        self.assertGreater(publish_index, first_journal)
+        durable_publication = next(
+            index
+            for index, event in enumerate(events)
+            if index > publish_index and event == ("fsync", transaction_root)
+        )
+        record_journal = next(
+            index
+            for index, event in enumerate(events)
+            if event[0] == "journal:prepared-removal"
+        )
+        durable_record = max(
+            index
+            for index, event in enumerate(events)
+            if index < record_journal
+            and event == ("fsync", transaction.transaction_dir)
+        )
+        mutation_index = next(
+            index for index, event in enumerate(events) if event[0] == "mutation"
+        )
+        self.assertGreater(record_journal, durable_record)
+        self.assertGreater(mutation_index, record_journal)
+        self.assertGreater(mutation_index, durable_publication)
+        self.assertTrue(transaction.journal_file.is_file())
+        transaction.rollback()
+
+    def test_staged_payload_is_durable_before_live_exposure(self) -> None:
+        plugin_id = "hancore.shibumi.memory"
+        spec = self.suite.plugins[plugin_id]
+        events: list[tuple[str, Path]] = []
+        original_fsync_tree = transaction_module._fsync_tree
+        original_fsync_directory = transaction_module._fsync_directory
+        original_replace = transaction_module.os.replace
+        original_write_journal = PluginTransaction._write_journal
+
+        def recording_fsync_tree(path: Path) -> None:
+            original_fsync_tree(path)
+            events.append(("tree", path))
+
+        def recording_fsync_directory(path: Path) -> None:
+            original_fsync_directory(path)
+            events.append(("fsync", path))
+
+        def recording_replace(source: object, destination: object) -> None:
+            original_replace(source, destination)
+            source_path = Path(source)
+            destination_path = Path(destination)
+            if source_path.name.startswith(".shibumi-stage.") \
+                    and destination_path == self.paths.plugin_dir / plugin_id:
+                events.append(("exposure", destination_path))
+
+        def recording_write_journal(
+            transaction: PluginTransaction, *args: object, **kwargs: object
+        ) -> None:
+            original_write_journal(transaction, *args, **kwargs)
+            phase = str(args[0] if args else kwargs.get("phase") or "")
+            events.append((f"journal:{phase}", transaction.journal_file))
+
+        with (
+            patch.object(
+                transaction_module, "_fsync_tree", side_effect=recording_fsync_tree
+            ),
+            patch.object(
+                transaction_module,
+                "_fsync_directory",
+                side_effect=recording_fsync_directory,
+            ),
+            patch.object(
+                transaction_module.os, "replace", side_effect=recording_replace
+            ),
+            patch.object(
+                PluginTransaction, "_write_journal", recording_write_journal
+            ),
+        ):
+            transaction = PluginTransaction(self.paths, self.runtime)
+            transaction.stage(
+                (spec,), revision="durability", suite_version=self.suite.version
+            )
+            transaction.expose()
+
+        tree_index = next(
+            index for index, event in enumerate(events) if event[0] == "tree"
+        )
+        durable_plugin_directory = next(
+            index
+            for index, event in enumerate(events)
+            if event == ("fsync", self.paths.plugin_dir.parent)
+        )
+        durable_stage_entry = next(
+            index
+            for index, event in enumerate(events)
+            if index > tree_index and event == ("fsync", self.paths.plugin_dir)
+        )
+        staged_journal = next(
+            index
+            for index, event in enumerate(events)
+            if event[0] == "journal:staged"
+        )
+        exposure_index = next(
+            index for index, event in enumerate(events) if event[0] == "exposure"
+        )
+        durable_exposure = next(
+            index
+            for index, event in enumerate(events)
+            if index > exposure_index
+            and event == ("fsync", self.paths.plugin_dir)
+        )
+        exposed_journal = next(
+            index
+            for index, event in enumerate(events)
+            if event[0] == "journal:exposed"
+        )
+        self.assertLess(durable_plugin_directory, tree_index)
+        self.assertLess(tree_index, durable_stage_entry)
+        self.assertLess(durable_stage_entry, staged_journal)
+        self.assertLess(staged_journal, exposure_index)
+        self.assertLess(exposure_index, durable_exposure)
+        self.assertLess(durable_exposure, exposed_journal)
+        transaction.rollback()
+
+    def test_transaction_preparation_is_private_until_complete(self) -> None:
+        self.paths.config_file.parent.mkdir(parents=True, exist_ok=True)
+        self.paths.config_file.write_text('{"version":1}\n', encoding="utf-8")
+        self.paths.menu_extension_file.parent.mkdir(parents=True, exist_ok=True)
+        self.paths.menu_extension_file.write_text("{}\n", encoding="utf-8")
+        original_atomic_write = transaction_module.atomic_write
+
+        for boundary, fail_after_write in (
+            ("directory", 0),
+            ("config snapshot", 1),
+            ("menu snapshot", 2),
+            ("journal", 3),
+        ):
+            with self.subTest(boundary=boundary):
+                calls = 0
+
+                def faulting_atomic_write(
+                    path: Path, payload: bytes, mode: int = 0o600
+                ) -> None:
+                    nonlocal calls
+                    calls += 1
+                    if fail_after_write == 0 and calls == 1:
+                        raise OSError("injected preparation failure")
+                    original_atomic_write(path, payload, mode)
+                    if calls == fail_after_write:
+                        raise OSError("injected preparation failure")
+
+                with patch.object(
+                    transaction_module,
+                    "atomic_write",
+                    side_effect=faulting_atomic_write,
+                ):
+                    with self.assertRaisesRegex(
+                        OSError, "injected preparation failure"
+                    ):
+                        PluginTransaction(self.paths, self.runtime)
+
+                transaction_root = self.paths.state_dir / "transactions"
+                self.assertFalse(
+                    transaction_root.is_dir() and any(transaction_root.iterdir())
+                )
+                self.assertEqual(
+                    self.paths.config_file.read_text(encoding="utf-8"),
+                    '{"version":1}\n',
+                )
+                self.assertEqual(
+                    self.paths.menu_extension_file.read_text(encoding="utf-8"),
+                    "{}\n",
+                )
+
+        transaction = PluginTransaction(self.paths, self.runtime)
+        self.assertTrue(transaction.transaction_dir.is_dir())
+        self.assertTrue(transaction.journal_file.is_file())
+        self.assertTrue(transaction.snapshot_file.is_file())
+        self.assertTrue(transaction.menu_extension_snapshot_file.is_file())
+        self.assertFalse(
+            any(
+                path.name.startswith(transaction_module.PREPARATION_PREFIX)
+                for path in transaction.transaction_dir.parent.iterdir()
+            )
+        )
+        transaction.rollback()
+
+    def test_recovery_discards_crash_interrupted_private_preparations(self) -> None:
+        transaction_root = self.paths.state_dir / "transactions"
+        transaction_root.mkdir(parents=True)
+        for prefix in (
+            transaction_module.PREPARATION_PREFIX,
+            transaction_module.CLEANUP_PREFIX,
+        ):
+            for boundary in range(4):
+                with self.subTest(prefix=prefix, boundary=boundary):
+                    transaction_root.mkdir(parents=True, exist_ok=True)
+                    private = transaction_root / f"{prefix}crash-{boundary}"
+                    private.mkdir()
+                    names = (
+                        "shell.json.before",
+                        "omarchy-menu.jsonc.before",
+                        "journal.json",
+                    )
+                    for name in names[:boundary]:
+                        (private / name).write_text(
+                            "partial\n", encoding="utf-8"
+                        )
+
+                    events_before = list(self.runtime.events)
+                    self.assertEqual(
+                        recover_transactions(self.paths, self.runtime), 0
+                    )
+                    self.assertFalse(private.exists())
+                    self.assertEqual(self.runtime.events, events_before)
+
+    def test_recovery_rejects_symlinked_transaction_root_without_traversal(self) -> None:
+        external = self.root / "external-transactions"
+        private = external / f"{transaction_module.CLEANUP_PREFIX}foreign"
+        private.mkdir(parents=True)
+        marker = private / "journal.json"
+        marker.write_text("do not remove\n", encoding="utf-8")
+        transaction_root = self.paths.state_dir / "transactions"
+        transaction_root.parent.mkdir(parents=True)
+        transaction_root.symlink_to(external, target_is_directory=True)
+
+        with self.assertRaisesRegex(TransactionError, "symlinked transaction root"):
+            recover_transactions(self.paths, self.runtime)
+
+        self.assertEqual(marker.read_text(encoding="utf-8"), "do not remove\n")
+
+    def test_recovery_validates_complete_journal_before_any_mutation(self) -> None:
+        self.install()
+        config_before = self.paths.config_file.read_bytes()
+        state_path = self.paths.state_dir / "install.json"
+        state_before = state_path.read_bytes()
+        plugin_ids = ("hancore.shibumi.memory", "hancore.shibumi.cpu")
+        payloads_before = {
+            plugin_id: (
+                self.paths.plugin_dir / plugin_id / "BarWidget.qml"
+            ).read_bytes()
+            for plugin_id in plugin_ids
+        }
+
+        for scenario in (
+            "missing snapshot",
+            "malformed second record",
+            "invalid late boolean",
+            "boolean schema",
+            "float schema",
+            "array journal",
+        ):
+            with self.subTest(scenario=scenario):
+                transaction_root = self.paths.state_dir / "transactions"
+                transaction_root.mkdir(parents=True, exist_ok=True)
+                token = f"validation-{scenario.replace(' ', '-')}"
+                directory = transaction_root / token
+                directory.mkdir()
+                records = []
+                for plugin_id in plugin_ids:
+                    records.append(
+                        {
+                            "action": "replace",
+                            "pluginId": plugin_id,
+                            "target": str(self.paths.plugin_dir / plugin_id),
+                            "stage": str(
+                                self.paths.plugin_dir
+                                / f".shibumi-stage.{token}.{plugin_id}"
+                            ),
+                            "backup": str(
+                                self.paths.plugin_dir
+                                / f".shibumi-backup.{token}.{plugin_id}"
+                            ),
+                            "hadTarget": True,
+                        }
+                    )
+                journal: object = {
+                    "schemaVersion": 1,
+                    "suiteId": "hancore.shibumi",
+                    "token": token,
+                    "phase": "prepared",
+                    "pluginRoot": str(self.paths.plugin_dir.resolve()),
+                    "configPath": str(self.paths.config_file.resolve()),
+                    "configExisted": True,
+                    "restartOnReconcile": False,
+                    "shellStopped": False,
+                    "payloadReloadExpected": False,
+                    "records": records,
+                }
+                if scenario == "malformed second record":
+                    records[1]["target"] = str(self.root / "outside")
+                elif scenario == "invalid late boolean":
+                    assert isinstance(journal, dict)
+                    journal["payloadReloadExpected"] = "false"
+                elif scenario == "boolean schema":
+                    assert isinstance(journal, dict)
+                    journal["schemaVersion"] = True
+                elif scenario == "float schema":
+                    assert isinstance(journal, dict)
+                    journal["schemaVersion"] = 1.0
+                elif scenario == "array journal":
+                    journal = []
+                (directory / "journal.json").write_text(
+                    json.dumps(journal) + "\n", encoding="utf-8"
+                )
+                if scenario != "missing snapshot":
+                    (directory / "shell.json.before").write_bytes(config_before)
+
+                events_before = list(self.runtime.events)
+                with self.assertRaises(TransactionError):
+                    recover_transactions(self.paths, self.runtime)
+
+                self.assertEqual(self.paths.config_file.read_bytes(), config_before)
+                self.assertEqual(state_path.read_bytes(), state_before)
+                for plugin_id in plugin_ids:
+                    self.assertEqual(
+                        (
+                            self.paths.plugin_dir
+                            / plugin_id
+                            / "BarWidget.qml"
+                        ).read_bytes(),
+                        payloads_before[plugin_id],
+                    )
+                self.assertEqual(self.runtime.events, events_before)
+                shutil.rmtree(transaction_root)
+
+    def test_post_state_commit_failures_roll_forward_without_payload_rollback(self) -> None:
+        self.install()
+        plugin_ids = ("hancore.shibumi.memory", "hancore.shibumi.cpu")
+
+        for boundary in (
+            "committed journal",
+            "backup archival",
+            "partial backup archival",
+            "archive data flush",
+            "partial archive copy",
+        ):
+            with self.subTest(boundary=boundary):
+                old_payloads = {
+                    plugin_id: (
+                        self.paths.plugin_dir / plugin_id / "BarWidget.qml"
+                    ).read_bytes()
+                    for plugin_id in plugin_ids
+                }
+                for plugin_id in plugin_ids:
+                    source_file = self.source / plugin_id / "BarWidget.qml"
+                    source_file.write_text(
+                        source_file.read_text(encoding="utf-8")
+                        + f"\n// post-state {boundary}\n",
+                        encoding="utf-8",
+                    )
+                suite = Suite.load(self.source)
+                specs = tuple(suite.plugins[plugin_id] for plugin_id in plugin_ids)
+                transaction = PluginTransaction(self.paths, self.runtime)
+                transaction.preflight_targets(specs)
+                transaction.stage(
+                    specs, revision="commit-point", suite_version=suite.version
+                )
+                transaction.expose()
+                expected_payloads = {
+                    plugin_id: (
+                        self.paths.plugin_dir / plugin_id / "BarWidget.qml"
+                    ).read_bytes()
+                    for plugin_id in plugin_ids
+                }
+                desired_state = {
+                    "boundary": boundary,
+                    "plugins": list(plugin_ids),
+                }
+
+                if boundary == "committed journal":
+                    original_write_journal = transaction._write_journal
+
+                    def fail_committed(
+                        phase: str,
+                        desired: object = "unchanged",
+                        archive: object = "unchanged",
+                    ) -> None:
+                        if phase == "committed":
+                            raise OSError("injected committed journal failure")
+                        original_write_journal(phase, desired, archive)
+
+                    fault = patch.object(
+                        transaction, "_write_journal", side_effect=fail_committed
+                    )
+                    expected_phase = "committing"
+                elif boundary == "backup archival":
+                    fault = patch.object(
+                        transaction,
+                        "_archive_backups",
+                        side_effect=OSError("injected backup archival failure"),
+                    )
+                    expected_phase = "committed"
+                elif boundary == "partial backup archival":
+                    def fail_after_first_archive() -> None:
+                        first = transaction.records[0]
+                        destination = (
+                            self.paths.state_dir / "backups" / transaction.token
+                        )
+                        destination.mkdir(parents=True, exist_ok=True)
+                        shutil.move(
+                            first["backup"], destination / first["pluginId"]
+                        )
+                        raise OSError("injected partial backup archival failure")
+
+                    fault = patch.object(
+                        transaction,
+                        "_archive_backups",
+                        side_effect=fail_after_first_archive,
+                    )
+                    expected_phase = "committed"
+                elif boundary == "archive data flush":
+                    original_fsync_tree = transaction_module._fsync_tree
+
+                    def fail_archive_data_flush(path: Path) -> None:
+                        if path.name.startswith(".") and path.name.endswith(".partial"):
+                            raise OSError("injected archive data flush failure")
+                        original_fsync_tree(path)
+
+                    fault = patch.object(
+                        transaction_module,
+                        "_fsync_tree",
+                        side_effect=fail_archive_data_flush,
+                    )
+                    expected_phase = "committed"
+                else:
+                    def fail_during_archive_copy() -> None:
+                        first = transaction.records[0]
+                        destination = (
+                            self.paths.state_dir / "backups" / transaction.token
+                        )
+                        partial = destination / f".{first['pluginId']}.partial"
+                        partial.mkdir(parents=True)
+                        shutil.copy2(
+                            Path(first["backup"]) / "BarWidget.qml",
+                            partial / "BarWidget.qml",
+                        )
+                        raise OSError("injected intra-record archive copy failure")
+
+                    fault = patch.object(
+                        transaction,
+                        "_archive_backups",
+                        side_effect=fail_during_archive_copy,
+                    )
+                    expected_phase = "committed"
+
+                with fault:
+                    with self.assertRaises(OSError):
+                        with transaction:
+                            transaction.finish(desired_state, archive_previous=True)
+
+                journal = json.loads(
+                    transaction.journal_file.read_text(encoding="utf-8")
+                )
+                self.assertTrue(transaction.commit_point_reached)
+                self.assertFalse(transaction.finished)
+                self.assertEqual(journal["phase"], expected_phase)
+                self.assertTrue(journal["archivePrevious"])
+                for plugin_id in plugin_ids:
+                    self.assertEqual(
+                        (self.paths.plugin_dir / plugin_id / "BarWidget.qml").read_bytes(),
+                        expected_payloads[plugin_id],
+                    )
+                self.assertEqual(
+                    json.loads(
+                        (self.paths.state_dir / "install.json").read_text(
+                            encoding="utf-8"
+                        )
+                    ),
+                    desired_state,
+                )
+
+                self.assertEqual(recover_transactions(self.paths, self.runtime), 1)
+                archive = self.paths.state_dir / "backups" / transaction.token
+                for plugin_id in plugin_ids:
+                    self.assertEqual(
+                        (archive / plugin_id / "BarWidget.qml").read_bytes(),
+                        old_payloads[plugin_id],
+                    )
+                    self.assertEqual(
+                        (self.paths.plugin_dir / plugin_id / "BarWidget.qml").read_bytes(),
+                        expected_payloads[plugin_id],
+                    )
+                self.assertFalse(self.hidden_transaction_paths())
+
+    def test_legacy_journal_without_shell_state_requires_restart(self) -> None:
+        self.install()
+        plugin_id = "hancore.shibumi.memory"
+        spec = self.suite.plugins[plugin_id]
+        transaction = PluginTransaction(
+            self.paths, self.runtime, restart_on_reconcile=True
+        )
+        transaction.stage(
+            (spec,), revision="legacy-journal", suite_version=self.suite.version
+        )
+        transaction.expose()
+        transaction.write_config(b'{"version":1,"bar":{"id":"broken"}}\n')
+        journal = json.loads(transaction.journal_file.read_text(encoding="utf-8"))
+        journal.pop("shellStopped")
+        transaction.journal_file.write_text(
+            json.dumps(journal, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        reloads_before = self.runtime.payload_reloads
+        self.runtime.fail_restart_count = 1
+
+        with self.assertRaisesRegex(RuntimeFailure, "injected shell restart failure"):
+            recover_transactions(self.paths, self.runtime)
+
+        self.assertTrue(transaction.transaction_dir.is_dir())
+        self.assertEqual(self.runtime.payload_reloads, reloads_before)
+        self.assertEqual(recover_transactions(self.paths, self.runtime), 1)
+        self.assertTrue(self.runtime.shell_running)
+        self.assertFalse(self.hidden_transaction_paths())
+
+    def test_failed_rollback_retains_journal_and_supports_later_recovery(self) -> None:
+        self.install()
+        original_config = self.paths.config_file.read_bytes()
+        original_menu = self.paths.menu_extension_file.read_bytes()
+        plugin_id = "hancore.shibumi.memory"
+        specs = self.suite.selected((plugin_id,))
+
+        def exposed_transaction() -> PluginTransaction:
+            transaction = PluginTransaction(self.paths, self.runtime)
+            transaction.preflight_targets(specs)
+            transaction.stage(
+                specs, revision="archive", suite_version=self.suite.version
+            )
+            transaction.expose()
+            transaction.write_config(b'{"version":1,"bar":{"id":"broken"}}\n')
+            transaction.write_menu_extension(b'{"broken":true}\n')
+            return transaction
+
+        original_atomic_write = transaction_module.atomic_write
+        faults = (
+            (
+                "plugin restoration",
+                lambda transaction: patch.object(
+                    transaction_module,
+                    "_restore_records",
+                    side_effect=TransactionError("injected plugin restore failure"),
+                ),
+            ),
+            (
+                "configuration restoration",
+                lambda transaction: patch.object(
+                    transaction_module,
+                    "atomic_write",
+                    side_effect=lambda path, payload: (
+                        (_ for _ in ()).throw(
+                            OSError("injected configuration restore failure")
+                        )
+                        if Path(path) == self.paths.config_file
+                        else original_atomic_write(path, payload)
+                    ),
+                ),
+            ),
+            (
+                "menu restoration",
+                lambda transaction: patch.object(
+                    transaction,
+                    "_restore_menu_extension",
+                    side_effect=OSError("injected menu restore failure"),
+                ),
+            ),
+            (
+                "shell reconciliation",
+                lambda transaction: patch.object(
+                    self.runtime,
+                    "reconcile_rollback",
+                    side_effect=RuntimeFailure("injected reconciliation failure"),
+                ),
+            ),
+        )
+
+        for label, fault in faults:
+            with self.subTest(boundary=label):
+                transaction = exposed_transaction()
+                with fault(transaction):
+                    with self.assertRaises((OSError, RuntimeFailure, TransactionError)):
+                        transaction.rollback()
+
+                self.assertTrue(transaction.transaction_dir.is_dir())
+                journal = json.loads(
+                    transaction.journal_file.read_text(encoding="utf-8")
+                )
+                self.assertEqual(journal["phase"], "recovery-required")
+                self.assertFalse(transaction.finished)
+
+                self.assertEqual(
+                    recover_transactions(self.paths, self.runtime), 1
+                )
+                self.assertFalse(transaction.transaction_dir.exists())
+                self.assertEqual(self.paths.config_file.read_bytes(), original_config)
+                self.assertEqual(
+                    self.paths.menu_extension_file.read_bytes(), original_menu
+                )
+                self.assertFalse(self.hidden_transaction_paths())
+
     def test_nonmanaged_collision_fails_without_artifacts(self) -> None:
         collision = self.paths.plugin_dir / "hancore.shibumi.ai"
         collision.mkdir(parents=True)
@@ -1780,6 +2752,17 @@ class SuiteLifecycleTests(unittest.TestCase):
             )
         )
 
+    def test_status_reports_retired_plugin_without_traceback(self) -> None:
+        self.install()
+        self.inject_retired_app_menu()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = command_status(self.suite, self.paths)
+        self.assertEqual(result, 1)
+        self.assertIn(
+            "Pending retirement: hancore.shibumi.menu", output.getvalue()
+        )
+
     def test_status_detects_locally_modified_installed_payload(self) -> None:
         self.install()
         target = self.paths.plugin_dir / "hancore.shibumi.ai" / "BarWidget.qml"
@@ -1792,6 +2775,71 @@ class SuiteLifecycleTests(unittest.TestCase):
             result = command_status(self.suite, self.paths)
         self.assertEqual(result, 1)
         self.assertIn("Locally modified: hancore.shibumi.ai", output.getvalue())
+
+    def test_source_revision_and_staging_share_one_payload_inventory(self) -> None:
+        (self.source / ".gitignore").write_text(
+            "__pycache__/\n*.py[cod]\n*.generated\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "init", "-q", str(self.source)], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.source), "config", "user.name", "Test"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.source),
+                "config",
+                "user.email",
+                "test@example.invalid",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.source), "add", "."], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.source), "commit", "-qm", "fixture"],
+            check=True,
+        )
+        expected_revision = subprocess.run(
+            ["git", "-C", str(self.source), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        manager_root = (
+            self.source / "hancore.shibumi.control-center" / "manager"
+        )
+        cache = manager_root / "__pycache__" / "manager.cpython-313.pyc"
+        cache.parent.mkdir(exist_ok=True)
+        cache.write_bytes(b"ignored cache bytes")
+        self.suite = Suite.load(self.source)
+        self.assertEqual(self.suite.revision(), expected_revision)
+
+        self.install()
+        installed_cache = (
+            self.paths.plugin_dir
+            / "hancore.shibumi.control-center"
+            / "manager/__pycache__/manager.cpython-313.pyc"
+        )
+        self.assertFalse(installed_cache.exists())
+
+        ignored_payload = manager_root / "runtime.generated"
+        ignored_payload.write_text("included ignored payload\n", encoding="utf-8")
+        self.assertEqual(
+            self.suite.revision(), f"{expected_revision}-dirty"
+        )
+        ignored_payload.unlink()
+
+        ordinary_untracked = manager_root / "runtime-extra.txt"
+        ordinary_untracked.write_text("ordinary untracked payload\n", encoding="utf-8")
+        self.assertEqual(
+            self.suite.revision(), f"{expected_revision}-dirty"
+        )
 
     def test_source_payload_symlink_is_rejected(self) -> None:
         link = self.source / "hancore.shibumi.ai" / "payload-link"

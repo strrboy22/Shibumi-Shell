@@ -58,7 +58,7 @@ created only when its complete runtime slice is ready to move.
 | `hancore.qsrise.battery` | `bar-widget` | G12 battery widget and panel | `power-state` |
 | `hancore.qsrise.brightness` | `bar-widget`, `service` | G13 monitor model, actions, widget and panel | official `omarchy.monitor` |
 | `hancore.qsrise.power-profile` | `bar-widget` | G14 profile widget and panel | `power-state` |
-| `hancore.qsrise.bluetooth` | `bar-widget`, `service` | G15 Bluetooth model, actions, widget and panel | official `omarchy.bluetooth` |
+| `hancore.qsrise.bluetooth` | `bar-widget`, `service` | G15 Bluetooth model, actions, widget and panel | Quickshell Bluetooth/PipeWire; validated Omarchy device/audio helper commands |
 
 `hancore.qsrise.notifications` and `hancore.qsrise.osd` are reserved future
 replacement IDs. They are not part of the initial profile because Quattro
@@ -352,7 +352,8 @@ The direct import of `services/PowerModel.js` is replaced with the
 Target: `hancore.qsrise.bluetooth`
 
 ```text
-adapters/BluetoothPanelBridge.qml
+adapters/BluetoothBackendAdapter.qml
+adapters/BluetoothModel.js
 services/BluetoothService.qml
 widgets/BluetoothPanel.qml
 widgets/BluetoothWidget.qml
@@ -409,7 +410,7 @@ the root. Paths in the table are relative to `tests/`.
 | Network | `network-widget-smoke.qml`, `fixtures/NetworkTestService.qml`, `fixtures/NetworkTestView.qml` |
 | Power state/Battery/Profile | `power-service-live-probe.qml`, `power-service-runtime-smoke.qml`, `power-widgets-smoke.qml`, `fixtures/PowerTestPanel.qml`, `fixtures/PowerTestService.qml`, `fixtures/power-bin/*` |
 | Brightness | `brightness-widget-smoke.qml`, `fixtures/MonitorTestPanel.qml`, `fixtures/MonitorTestView.qml` |
-| Bluetooth | `bluetooth-widget-smoke.qml`, `fixtures/BluetoothTestPanel.qml`, `fixtures/BluetoothTestView.qml` |
+| Bluetooth | `bluetooth-widget-smoke.qml`, `bluetooth-ipc-ownership-regression.sh`, `fixtures/BluetoothTestBackend.qml`, `fixtures/BluetoothTestView.qml` |
 | Shared panel primitives | `panel-surface-smoke.qml` |
 
 Missing focused CPU, picker-overlay, and multi-bar reuse tests must be added

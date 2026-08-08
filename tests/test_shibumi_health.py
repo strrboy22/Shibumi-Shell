@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +19,20 @@ HEALTH = (
     / "hancore.shibumi.control-center"
     / "manager"
     / "shibumi-health"
+)
+
+QUICKSHELL_EMPTY_REGISTRY = "No running instances.\n"
+INVALID_EMPTY_REGISTRY_OUTPUTS = (
+    "",
+    "No running instances.",
+    " No running instances.\n",
+    "No running instances. \n",
+    "No running instances.\r\n",
+    "No running instances.\nextra",
+    "prefix No running instances.\n",
+    "{}",
+    "null",
+    "not-json\n",
 )
 
 
@@ -205,19 +220,19 @@ class HealthDiagnosticsTests(unittest.TestCase):
     def use_package_install(
         self,
         *,
-        installed_version: str | None = "0.1.1beta.4-1",
+        installed_version: str | None = "0.1.1beta.7-1",
         available_version: str | None = None,
         fetch_error: str = "",
     ) -> Path:
         self.state.pop("sourceRoot", None)
         self.state.update(
             {
-                "suiteVersion": "0.1.1-beta.4",
+                "suiteVersion": "0.1.1-beta.7",
                 "installOrigin": "package",
                 "payloadRoot": "/usr/share/shibumi-shell",
-                "sourceRevision": "package:0.1.1-beta.4",
+                "sourceRevision": "package:0.1.1-beta.7",
                 "packageName": "shibumi-shell",
-                "packageVersion": "0.1.1-beta.4",
+                "packageVersion": "0.1.1-beta.7",
             }
         )
         self.write_state(self.state)
@@ -255,6 +270,31 @@ class HealthDiagnosticsTests(unittest.TestCase):
     def by_id(self, payload: dict[str, object]) -> dict[str, dict[str, object]]:
         return {item["id"]: item for item in payload["checks"]}
 
+    def process_probe_from_result(
+        self,
+        *,
+        stdout: str = "",
+        stderr: str = "",
+        returncode: int = 0,
+        side_effect: BaseException | None = None,
+    ):
+        environment = dict(self.environment)
+        environment.pop("SHIBUMI_HEALTH_PROCESS_FILE", None)
+        environment.pop("SHIBUMI_HEALTH_PROCESS_LIVE", None)
+        completed = Mock(returncode=returncode, stdout=stdout, stderr=stderr)
+        runner = Mock(return_value=completed, side_effect=side_effect)
+        probe_class = self.module["Probe"]
+        globals_map = probe_class.load_processes.__globals__
+        with patch.dict(os.environ, environment, clear=True):
+            probe = probe_class(fetch=False)
+            with patch.dict(globals_map, {"run": runner}):
+                probe.load_processes()
+        probe.check_processes()
+        return probe
+
+    def process_probe_from_stdout(self, stdout: str):
+        return self.process_probe_from_result(stdout=stdout)
+
     def test_healthy_runtime_is_structured_and_read_only(self) -> None:
         payload = self.run_health()
         checks = self.by_id(payload)
@@ -278,9 +318,9 @@ class HealthDiagnosticsTests(unittest.TestCase):
         self.assertEqual(payload["overall"], "healthy")
         self.assertEqual(payload["installOrigin"], "package")
         self.assertEqual(payload["packageName"], "shibumi-shell")
-        self.assertEqual(payload["packageVersion"], "0.1.1-beta.4")
+        self.assertEqual(payload["packageVersion"], "0.1.1-beta.7")
         self.assertEqual(checks["package-status"]["status"], "ok")
-        self.assertEqual(checks["package-status"]["value"], "0.1.1beta.4-1")
+        self.assertEqual(checks["package-status"]["value"], "0.1.1beta.7-1")
         self.assertEqual(checks["package-update"]["value"], "Not checked")
         self.assertNotIn("source-status", checks)
         self.assertNotIn("source-update", checks)
@@ -512,6 +552,70 @@ class HealthDiagnosticsTests(unittest.TestCase):
         self.assertEqual(len(process_checks), 1)
         self.assertEqual(process_checks[0]["value"], "Check failed")
 
+    def test_empty_quickshell_registry_sentinel_reports_zero_processes(self) -> None:
+        probe = self.process_probe_from_stdout(QUICKSHELL_EMPTY_REGISTRY)
+        checks = [check for check in probe.checks if check.id == "quickshell-process"]
+        self.assertFalse(probe.process_probe_failed)
+        self.assertEqual(probe.processes, [])
+        self.assertEqual(probe.production_pids, [])
+        self.assertEqual(len(checks), 1)
+        self.assertEqual(checks[0].value, "0 production processes")
+
+    def test_empty_registry_sentinel_with_nonzero_exit_fails_closed(self) -> None:
+        probe = self.process_probe_from_result(
+            stdout=QUICKSHELL_EMPTY_REGISTRY,
+            stderr="registry unavailable",
+            returncode=23,
+        )
+        checks = [check for check in probe.checks if check.id == "quickshell-process"]
+        self.assertTrue(probe.process_probe_failed)
+        self.assertEqual(probe.processes, [])
+        self.assertEqual(len(checks), 1)
+        self.assertEqual(checks[0].value, "Check failed")
+        self.assertIn("registry unavailable", checks[0].detail)
+
+    def test_empty_registry_sentinel_timeout_fails_closed(self) -> None:
+        timeout = subprocess.TimeoutExpired(
+            ["qs", "list", "--all", "--json"],
+            0.01,
+            output=QUICKSHELL_EMPTY_REGISTRY,
+        )
+        probe = self.process_probe_from_result(side_effect=timeout)
+        checks = [check for check in probe.checks if check.id == "quickshell-process"]
+        self.assertTrue(probe.process_probe_failed)
+        self.assertEqual(probe.processes, [])
+        self.assertEqual(len(checks), 1)
+        self.assertEqual(checks[0].value, "Check failed")
+        self.assertIn("timed out", checks[0].detail)
+
+    def test_quickshell_registry_json_arrays_remain_supported(self) -> None:
+        probe = self.process_probe_from_stdout("[]")
+        self.assertFalse(probe.process_probe_failed)
+        self.assertEqual(probe.processes, [])
+
+        instance = {
+            "id": "target-1",
+            "config_path": str(self.omarchy / "shell/shell.qml"),
+            "pid": 4242,
+        }
+        probe = self.process_probe_from_stdout(json.dumps([instance]))
+        self.assertFalse(probe.process_probe_failed)
+        self.assertEqual(probe.processes, [instance])
+        self.assertEqual(probe.production_pids, [4242])
+
+    def test_empty_registry_sentinel_variants_fail_closed(self) -> None:
+        for stdout in INVALID_EMPTY_REGISTRY_OUTPUTS:
+            with self.subTest(stdout=stdout):
+                probe = self.process_probe_from_stdout(stdout)
+                checks = [
+                    check
+                    for check in probe.checks
+                    if check.id == "quickshell-process"
+                ]
+                self.assertTrue(probe.process_probe_failed)
+                self.assertEqual(len(checks), 1)
+                self.assertEqual(checks[0].value, "Check failed")
+
     def test_bar_mismatch_and_failed_lifecycle_are_errors(self) -> None:
         self.registry[0]["active"] = False
         self.registry[2]["active"] = True
@@ -555,6 +659,53 @@ class HealthDiagnosticsTests(unittest.TestCase):
         check = self.by_id(payload)["runtime-errors"]
         self.assertEqual(check["status"], "ok")
         self.assertEqual(check["value"], "None detected")
+
+    def test_failed_runtime_log_query_never_reports_clean(self) -> None:
+        environment = dict(self.environment)
+        environment.pop("SHIBUMI_HEALTH_LOG_FILE", None)
+        probe_class = self.module["Probe"]
+        globals_map = probe_class.check_logs.__globals__
+        failed = Mock(
+            returncode=23,
+            stdout="",
+            stderr=f"registry unavailable at {self.home}/private.log",
+        )
+        with patch.dict(os.environ, environment, clear=True):
+            probe = probe_class(fetch=False)
+            probe.production_pids = [4242]
+            with patch.dict(globals_map, {"run": Mock(return_value=failed)}):
+                probe.check_logs()
+        checks = [
+            check for check in probe.checks if check.id == "runtime-errors"
+        ]
+        self.assertEqual(len(checks), 1)
+        self.assertEqual(checks[0].status, "warning")
+        self.assertEqual(checks[0].value, "Log unavailable")
+        self.assertIn("registry unavailable", checks[0].detail)
+        self.assertNotIn(str(self.home), checks[0].detail)
+        self.assertNotEqual(checks[0].value, "None detected")
+
+    def test_failed_runtime_log_query_redacts_sensitive_output(self) -> None:
+        environment = dict(self.environment)
+        environment.pop("SHIBUMI_HEALTH_LOG_FILE", None)
+        probe_class = self.module["Probe"]
+        globals_map = probe_class.check_logs.__globals__
+        failed = Mock(
+            returncode=9,
+            stdout="",
+            stderr="password token private-value",
+        )
+        with patch.dict(os.environ, environment, clear=True):
+            probe = probe_class(fetch=False)
+            probe.production_pids = [4242]
+            with patch.dict(globals_map, {"run": Mock(return_value=failed)}):
+                probe.check_logs()
+        check = next(
+            check for check in probe.checks if check.id == "runtime-errors"
+        )
+        self.assertEqual(check.status, "warning")
+        self.assertEqual(check.detail, "qs log exited with 9")
+        self.assertNotIn("private-value", check.detail)
 
     def test_manual_fetch_refreshes_only_remote_refs(self) -> None:
         before = subprocess.run(

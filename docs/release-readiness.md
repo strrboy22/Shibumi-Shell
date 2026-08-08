@@ -1,9 +1,12 @@
-# Is Shibumi 0.1.1-beta.4 ready for prerelease testing?
+# Is Shibumi 0.1.1-beta.7 ready for prerelease testing?
 
 > **Document status: Current validation and release gate.** This page records the latest Shibumi evidence. It cannot override [`../ARCHITECTURE.md`](../ARCHITECTURE.md).
 
-Shibumi `0.1.1-beta.4` is ready for prerelease testing. The validation system passes the
-complete automated contract and the affected live Wayland workflows. Physical
+Shibumi `0.1.1-beta.7` is an automated prerelease candidate. Its complete
+contract is revision-bound across the installed-package, installed-source-parity,
+and forward-compatibility proof axes. Destructive live Wayland acceptance is
+retained only for the exact revisions that produced it; the release workflow
+must record fresh checksummed evidence for the tagged candidate. Physical
 multi-monitor, enterprise Wi-Fi, and the remaining Bluetooth workflows still
 block a stable public release.
 
@@ -20,12 +23,16 @@ documentation and are not required by Shibumi users.
 - **Policy**: Maintainers run destructive runtime acceptance only on the
   isolated validation system
 
-`/home/hancore/Projects/Quickshell-Dots` remains a read-only V1 and V2 reference.
+The read-only V1 and V2 reference is pinned by repository revision and content
+digests in
+[`quickshell-dots-d0896fc-v2-deec8103.json`](../contracts/baselines/quickshell-dots-d0896fc-v2-deec8103.json);
+no maintainer-local checkout path is part of the acceptance contract.
 
 ## Prerelease acceptance summary
 
-The existing audit evidence plus the 2026-08-04 beta.4 regression and live
-runtime verification produced these results:
+The beta.7 working-tree candidate plus explicitly retained beta.5 and beta.6
+acceptance currently provide these results. Rows marked historical do not become
+beta.7 evidence until the revision-bound release collector reruns them:
 
 | Gate | Result |
 | --- | --- |
@@ -34,15 +41,19 @@ runtime verification produced these results:
 | Embedded V2 differences | Passed: 26 intentional differences classified against `d0896fc` |
 | Quattro compatibility | Passed against `4.0.0.r1508.g12af188-1` |
 | Plugin validation and self-containment | Passed for all 24 plugins |
-| Complete repository contract | Passed on the validation system |
-| Suite lifecycle unit tests | Passed: 55 of 55 |
-| Control Center manager tests | Passed: 14 of 14 |
-| Transactional live update | Passed for all 24 plugins |
+| Complete repository contract | Passed against the installed package baseline; source-parity and forward-compatibility are separate required jobs |
+| Suite lifecycle unit tests | Passed: 77 of 77 |
+| Control Center manager tests | Passed: 29 of 29 |
+| Health tests | Passed: 31 of 31 |
+| INC-013 convergence contract | Passed: 14 of 14 |
+| Baseline locale matrix | Passed under C, C UTF-8, and en_US UTF-8 |
+| Transactional live update | Working-tree beta.7 pass for all 24 plugins on two physical systems; clean-commit collector still required |
 | Generic plugin-manager recovery | Passed: individual Bluetooth disable detected and repaired transactionally |
-| Ownership repair | Passed: 25 markerless alpha plugins adopted and marked |
+| Ownership repair | Passed: all 24 current markerless plugins adopted and marked |
 | Bar continuity | Passed: Shibumi to Omarchy to Shibumi |
-| Configuration continuity | Passed: `shell.json` returned byte-identically |
+| Configuration continuity | Passed: `shell.json` returned semantically unchanged after repeated transitions |
 | Runtime process count | Passed: one Quickshell process after each switch |
+| Network label runtime | Passed on Ethernet and Wi-Fi across repeated V1, V2, Omarchy, and V2-return transitions |
 | Current QML log | Passed: no Shibumi type, reference, loader, or binding-loop error |
 | Control Center **Bars** view | Passed on the physical Wayland session |
 | Bluetooth connection and panel | Passed with a live connected phone |
@@ -56,6 +67,7 @@ The hardened center smoke fails on unavailable QML types or a missing `PanelWind
 
 The audit fixed these release blockers:
 
+- Bounded V1/V2 Network labels use independent text metrics instead of a cyclic `width`/`implicitWidth` binding
 - The **Bars** page can return from Omarchy to Shibumi
 - Suite activation excludes stock Omarchy widgets, and the continuity manager rejects mixed-layout contamination before saving a Shibumi profile
 - The continuity manager discovers the current `/usr/share/omarchy` install when `OMARCHY_PATH` is absent
@@ -84,8 +96,12 @@ The lifecycle adapter enforces these controls:
 - It validates all 24 manifests with the official Omarchy validator
 - It rejects symlinks, special files, unsafe entry points, foreign markers, and unknown replacement directories
 - It hashes each plugin and the complete suite before activation
-- It snapshots installed plugins and `shell.json`
-- It rescans, reloads, and verifies the exact running payload
+- It prepares and publishes recovery transactions atomically before live mutation
+- It durably orders installed plugins, `shell.json`, install state, generated menu state, journals, archive copies, and cleanup
+- It validates complete recovery state before changing files or stopping the shell
+- It retains the recovery journal and snapshots if rollback itself fails
+- It restarts for bar-owner/provider handoff and reserves hot reload for unchanged ownership
+- It verifies the exact running payload after reconciliation
 - It restores the previous payload and configuration after a failed gate
 
 The theme updater disables Git hooks, executable filters, prompts, and external protocols. It applies only an unchanged reviewed commit with a fast-forward merge. The audit found no critical or high-severity security or supply-chain issue.
@@ -119,6 +135,14 @@ Before making the repository public:
 5. Repeat the complete validation contract on the exact public-release commit
 
 ## Release evidence
+
+`scripts/collect-release-evidence` runs the manager, suite, health, package,
+INC-013, mutation, dry-run, three complete host-contract jobs, and isolated
+Quattro runtime gate. It records the exact candidate identity, commands, exit
+codes, host versions, baseline identities, bounded log paths, and SHA-256 log
+digests. The tag workflow runs this collector on the isolated validation runner
+before publication and publishes both the manifest and its log bundle. Missing
+baseline paths, failed commands, or a non-clean tagged candidate fail closed.
 
 The detailed contracts and historical measurements remain available in:
 

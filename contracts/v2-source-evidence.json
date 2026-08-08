@@ -1,6 +1,7 @@
 {
   "schemaVersion": 1,
-  "referenceRoot": "../Quickshell-Dots/versions/V2",
+  "referenceBaseline": "contracts/baselines/quickshell-dots-d0896fc-v2-deec8103.json",
+  "referenceRootId": "v2",
   "sourceGlobs": ["*.qml", "*.js", "modules/*.qml", "panels/*.qml", "panels/*.js"],
   "features": [
     {
@@ -84,8 +85,8 @@
       "id": "bluetooth",
       "strategy": "port",
       "sources": ["modules/BluetoothWidget.qml", "panels/BluetoothPanel.qml"],
-      "implementation": ["hancore.shibumi.bluetooth/BarWidget.qml", "hancore.shibumi.bluetooth/BluetoothPanelBridge.qml", "hancore.shibumi.bluetooth/Service.qml"],
-      "evidence": ["tests/bluetooth-plugin-regression.sh", "tests/bluetooth-plugin-smoke.qml"]
+      "implementation": ["hancore.shibumi.bluetooth/BarWidget.qml", "hancore.shibumi.bluetooth/BluetoothBackendAdapter.qml", "hancore.shibumi.bluetooth/Service.qml"],
+      "evidence": ["tests/bluetooth-plugin-regression.sh", "tests/bluetooth-plugin-smoke.qml", "tests/bluetooth-ipc-ownership-regression.sh"]
     },
     {
       "id": "brightness",

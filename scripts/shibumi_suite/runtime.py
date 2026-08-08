@@ -232,25 +232,28 @@ class OmarchyRuntime:
             )
         return (self.omarchy_root / "shell/shell.qml").resolve(strict=False)
 
-    def quickshell_instances(self) -> list[dict[str, Any]]:
+    def quickshell_instances(self, *, timeout: float = 6) -> list[dict[str, Any]]:
         result = self.run(
             ["quickshell", "list", "--all", "--json"],
-            timeout=6,
+            timeout=timeout,
         )
-        try:
-            values = json.loads(result.stdout)
-        except json.JSONDecodeError as error:
-            raise RuntimeFailure(
-                "Quickshell returned malformed instance JSON"
-            ) from error
+        if result.stdout == "No running instances.\n":
+            values = []
+        else:
+            try:
+                values = json.loads(result.stdout)
+            except json.JSONDecodeError as error:
+                raise RuntimeFailure(
+                    "Quickshell returned malformed instance JSON"
+                ) from error
         if not isinstance(values, list):
             raise RuntimeFailure("Quickshell instance response is not an array")
         return [value for value in values if isinstance(value, dict)]
 
-    def shell_instances(self) -> list[dict[str, Any]]:
+    def shell_instances(self, *, timeout: float = 6) -> list[dict[str, Any]]:
         expected = self.shell_config_file
         matches: list[dict[str, Any]] = []
-        for value in self.quickshell_instances():
+        for value in self.quickshell_instances(timeout=timeout):
             config_path = value.get("config_path")
             if not isinstance(config_path, str) or not config_path:
                 continue
@@ -344,11 +347,20 @@ class OmarchyRuntime:
                 "the foreign instance was left untouched"
             )
 
-    def stop_shell(self, *, max_instances: int = 8) -> None:
-        """Drain running Quattro instances before changing the active bar owner."""
+    def stop_shell(
+        self,
+        *,
+        timeout: float = 6,
+        quiet_period: float = 0.1,
+    ) -> None:
+        """Drain the exact Quattro registry until it remains stably empty."""
         shell_path = self.omarchy_root / "shell" if self.omarchy_root else None
         if shell_path is None:
             raise RuntimeFailure("cannot stop shell without an Omarchy root")
+        if timeout <= 0:
+            raise RuntimeFailure("shell drain timeout must be positive")
+        if quiet_period < 0:
+            raise RuntimeFailure("shell drain quiet period cannot be negative")
         command = [
             "quickshell",
             "kill",
@@ -356,16 +368,105 @@ class OmarchyRuntime:
             str(shell_path),
             "--any-display",
         ]
-        for _attempt in range(max_instances):
-            result = self.run(command, timeout=6, check=False)
+        poll_interval = 0.05
+        deadline = time.monotonic() + timeout
+        evidence_deadline = deadline + 0.15
+        final_snapshot_limit = 0.1
+        empty_since: float | None = None
+        snapshots: list[list[dict[str, Any]]] = []
+        instances: list[dict[str, Any]] = []
+        deadline_operation_error: str | None = None
+
+        def evidence(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return [
+                {
+                    "id": str(value.get("id") or ""),
+                    "pid": value.get("pid"),
+                    "config_path": str(value.get("config_path") or ""),
+                }
+                for value in values
+            ]
+
+        def record(values: list[dict[str, Any]]) -> None:
+            snapshots.append(evidence(values))
+            del snapshots[:-6]
+
+        while time.monotonic() < deadline:
+            registry_budget = deadline - time.monotonic()
+            if registry_budget <= 0:
+                break
             try:
-                instances = self.shell_instances()
-            except RuntimeFailure:
-                instances = [{}] if result.returncode == 0 else []
+                instances = self.shell_instances(timeout=min(6, registry_budget))
+            except RuntimeFailure as error:
+                if time.monotonic() < deadline:
+                    raise
+                deadline_operation_error = str(error)
+                break
+            record(instances)
+            now = time.monotonic()
+
             if not instances:
-                return
-            time.sleep(0.1)
-        raise RuntimeFailure("too many Quickshell instances matched the Omarchy shell")
+                if empty_since is None:
+                    empty_since = now
+                if now - empty_since >= max(0.0, quiet_period - 1e-9):
+                    return
+                sleep_for = min(
+                    poll_interval,
+                    max(0.0, deadline - now),
+                    max(0.0, quiet_period - (now - empty_since)),
+                )
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+                continue
+
+            kill_budget = deadline - time.monotonic()
+            if kill_budget <= 0:
+                break
+            empty_since = None
+            try:
+                self.run(command, timeout=min(6, kill_budget), check=False)
+            except RuntimeFailure as error:
+                if time.monotonic() < deadline:
+                    raise
+                deadline_operation_error = str(error)
+                break
+            now = time.monotonic()
+            if now < deadline:
+                time.sleep(min(poll_interval, deadline - now))
+
+        # The last in-flight command may have replaced the selected
+        # registration. Spend at most the explicit evidence grace on one final
+        # snapshot, retaining the last good evidence if that read itself fails.
+        final_snapshot_error: str | None = None
+        evidence_budget = evidence_deadline - time.monotonic()
+        if evidence_budget > 0:
+            try:
+                instances = self.shell_instances(
+                    timeout=min(final_snapshot_limit, evidence_budget)
+                )
+            except RuntimeFailure as error:
+                final_snapshot_error = str(error)
+            else:
+                record(instances)
+        else:
+            final_snapshot_error = (
+                "evidence deadline exhausted before final registry snapshot"
+            )
+        remaining = evidence(instances)
+        detail = (
+            "Quickshell registry did not converge before the drain deadline; "
+            f"remaining={json.dumps(remaining, sort_keys=True)}; "
+            f"snapshots={json.dumps(snapshots, sort_keys=True)}"
+        )
+        if deadline_operation_error is not None:
+            detail += "; deadline_operation_error=" + json.dumps(
+                deadline_operation_error
+            )
+        if final_snapshot_error is not None:
+            detail += "; final_snapshot_error=" + json.dumps(
+                final_snapshot_error
+            )
+        raise RuntimeFailure(detail)
 
     def reload_payload(self, *, timeout: float = 8) -> None:
         deadline = time.monotonic() + timeout
@@ -574,24 +675,43 @@ class OmarchyRuntime:
             time.sleep(0.1)
         raise RuntimeFailure(f"Shibumi uninstall verification failed: {detail}")
 
-    def reconcile_best_effort(self, *, restart_shell: bool = False) -> None:
-        actions = (
-            (
-                self.restart_shell,
-                self.rescan,
-                self.reload_payload,
-                self.refresh_menu,
-            )
-            if restart_shell
-            else (
-                self.rescan,
-                self.reload_config,
-                self.reload_payload,
-                self.refresh_menu,
-            )
-        )
+    def reconcile_rollback(
+        self,
+        *,
+        restart_required: bool,
+        shell_was_stopped: bool,
+        payload_reload_expected: bool,
+    ) -> None:
+        """Reconcile restored bytes without hiding a dead or stale shell."""
+        if restart_required:
+            try:
+                self.restart_shell()
+                return
+            except RuntimeFailure as restart_error:
+                if shell_was_stopped:
+                    raise
+                # A restart command may reject its own preflight before killing
+                # the current process. Only that still-running case may use
+                # ownership-preserving in-process rollback reconciliation.
+                try:
+                    self.verify_single_shell_instance()
+                    self.ping()
+                except RuntimeFailure:
+                    raise restart_error
+
+        actions = [self.rescan, self.reload_config]
+        if payload_reload_expected:
+            actions.append(self.reload_payload)
+        actions.append(self.refresh_menu)
+        failures: list[str] = []
         for action in actions:
             try:
                 action()
-            except RuntimeFailure:
-                pass
+            except RuntimeFailure as error:
+                failures.append(f"{action.__name__}: {error}")
+        if failures:
+            raise RuntimeFailure(
+                "rollback reconciliation failed: " + "; ".join(failures)
+            )
+        self.verify_single_shell_instance()
+        self.ping()

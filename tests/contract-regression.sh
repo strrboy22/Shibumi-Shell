@@ -3,6 +3,8 @@
 set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+source "$repo_root/tests/lib/baselines.sh"
+shibumi_load_omarchy_baseline
 cd "$repo_root"
 
 fail() {
@@ -13,10 +15,15 @@ fail() {
 command -v jq >/dev/null 2>&1 || fail "jq is required"
 command -v rg >/dev/null 2>&1 || fail "rg is required"
 command -v python3 >/dev/null 2>&1 || fail "python3 is required"
+[[ -x /usr/bin/quickshell ]] || fail "quickshell is required for the complete contract"
 
+"$repo_root/tests/baseline-contract-regression.sh"
 "$repo_root/tests/documentation-regression.py"
 python3 "$repo_root/tests/test_package_release.py"
+python3 "$repo_root/tests/test_shibumi_manager.py"
 python3 "$repo_root/tests/test_shibumi_suite.py"
+python3 "$repo_root/tests/test_inc013_drain_contract.py"
+python3 "$repo_root/tests/quickshell-empty-registry-mutation.py"
 "$repo_root/tests/state-matrix-contract-regression.sh"
 "$repo_root/tests/v1-feature-evidence-regression.sh"
 "$repo_root/tests/v2-source-evidence-regression.sh"
@@ -109,6 +116,9 @@ rg -q 'function onResourcesLost\(\)' core/WindowRecovery.qml \
   || fail "window recovery does not handle resourcesLost"
 rg -q 'function onClosed\(\)' core/WindowRecovery.qml \
   || fail "window recovery does not handle closed"
+if rg -q 'targetWindow\.visible[[:space:]]*=' core/WindowRecovery.qml; then
+  fail "window recovery imperatively destroys the bar visibility binding"
+fi
 rg -q 'visible: bar\.hostReady && bar\.styleReady && validScreen && !bar\.barHidden' core/BarPanel.qml \
   || fail "output must wait for host and style readiness and honor bar-off"
 rg -q 'active: barWindow\.bar\.hostReady && barWindow\.bar\.styleReady' core/BarPanel.qml \
@@ -126,8 +136,9 @@ rg -q 'registeredWidgetComponent\("omarchy\.network"\)' services/NetworkService.
   || fail "root network owner bypasses the stable widget resolver"
 rg -q 'registeredWidgetComponent\("omarchy\.monitor"\)' services/MonitorService.qml \
   || fail "root monitor owner bypasses the stable widget resolver"
-rg -q 'registeredWidgetComponent\("omarchy\.bluetooth"\)' services/BluetoothService.qml \
-  || fail "root Bluetooth owner bypasses the stable widget resolver"
+if rg -q 'registeredWidgetComponent\("omarchy\.bluetooth"\)' services/BluetoothService.qml; then
+  fail "root Bluetooth owner must not instantiate the complete host widget"
+fi
 if rg -U -q 'visible: root\.anchorIndex < 0\n[[:space:]]*bar: root\.bar\n[[:space:]]*region: "center"\n[[:space:]]*entries: root\.entries' core/CenterSection.qml; then
   fail "inactive center fallback must not instantiate duplicate widgets"
 fi
@@ -635,10 +646,10 @@ rg -q 'G15: \["hancore.shibumi.bluetooth"\]' core/GroupRegistry.js \
   || fail "G15 is not owned by the Shibumi bluetooth presentation"
 rg -q 'hancore\.shibumi\.bluetooth' widgets/WidgetRegistry.qml \
   || fail "Shibumi bluetooth presentation is not registered"
-[[ $(rg -c 'BluetoothPanelBridge \{' hancore.shibumi.bluetooth/Service.qml) -eq 1 ]] \
+[[ $(rg -c 'BluetoothBackendAdapter \{' hancore.shibumi.bluetooth/Service.qml) -eq 1 ]] \
   || fail "Bluetooth state must have one root owner"
-[[ $(rg -c 'Adapters\.BluetoothPanelBridge \{' services/BluetoothService.qml) -eq 1 ]] \
-  || fail "root Bluetooth service must own exactly one official backend"
+[[ $(rg -c 'Adapters\.BluetoothBackendAdapter \{' services/BluetoothService.qml) -eq 1 ]] \
+  || fail "root Bluetooth service must own exactly one native backend"
 rg -q 'bar\.bluetoothService' widgets/BluetoothWidget.qml \
   || fail "Bluetooth view does not consume the shared owner"
 rg -q 'property var sessionOwners: \[\]' services/BluetoothService.qml \
@@ -647,19 +658,74 @@ rg -q 'target: "omarchy\.bluetooth"' services/BluetoothService.qml \
   || fail "Bluetooth service does not own the single legacy IPC target"
 rg -q 'bar\.hideBarWidget\("omarchy\.bluetooth"\)' services/BluetoothService.qml \
   || fail "Bluetooth legacy close/hide is not routed to the local panel"
-rg -q 'manageIpc: false' adapters/BluetoothPanelBridge.qml \
-  || fail "hidden official Bluetooth owner still owns the legacy IPC target"
-rg -q 'bridge\.stopDiscovery\(\)' services/BluetoothService.qml \
+rg -q 'adapter\.stopDiscovery\(\)' services/BluetoothService.qml \
   || fail "Bluetooth discovery is not stopped after the final panel closes"
+for bluetooth_adapter in \
+  adapters/BluetoothBackendAdapter.qml \
+  hancore.shibumi.bluetooth/BluetoothBackendAdapter.qml; do
+  rg -q '^import Quickshell\.Bluetooth$' "$bluetooth_adapter" \
+    || fail "$bluetooth_adapter does not own the native BlueZ model"
+  rg -q '^import Quickshell\.Services\.Pipewire$' "$bluetooth_adapter" \
+    || fail "$bluetooth_adapter does not own Bluetooth audio routing"
+  for device_signal in ConnectedDevices KnownDevices DiscoveredDevices; do
+    rg -U -q "on${device_signal}Changed: \\{[^}]*syncNativePendingActions\\(\\)[^}]*syncNativeAudioHandoffIntents\\(\\)" \
+      "$bluetooth_adapter" \
+      || fail "$bluetooth_adapter ignores ${device_signal} property transitions"
+  done
+  rg -Fq 'if (discovering && !discoveryOwned) return true' \
+    "$bluetooth_adapter" \
+    || fail "$bluetooth_adapter can claim an external discovery scan"
+  rg -q 'property var discoveryOwnerAdapter: null' "$bluetooth_adapter" \
+    || fail "$bluetooth_adapter does not bind discovery ownership to an adapter"
+  rg -U -q 'function confirmRequestedDiscovery\(\) \{(.|\n)*?requested\.discovering(.|\n)*?discoveryOwned = true(.|\n)*?\n  \}' \
+    "$bluetooth_adapter" \
+    || fail "$bluetooth_adapter does not confirm discovery ownership from observed state"
+  rg -q 'property var audioHandoffIntent: null' "$bluetooth_adapter" \
+    || fail "$bluetooth_adapter lacks explicit latest-only audio intent state"
+  rg -U -q 'function validatePendingAudioOutput\(\)[^}]*!radioEnabled[^}]*!device\.connected[^}]*!deviceUsesCurrentAdapter' \
+    "$bluetooth_adapter" \
+    || fail "$bluetooth_adapter does not revalidate audio handoff state"
+  [[ $(rg -c '^  Timer \{' "$bluetooth_adapter") -eq 4 ]] \
+    || fail "$bluetooth_adapter must have exactly four bounded lifecycle timers"
+  if rg -q 'IpcHandler \{|Loader \{|panelSource|panelComponent|registeredWidget' \
+      "$bluetooth_adapter"; then
+    fail "$bluetooth_adapter still owns IPC or loads a foreign UI component"
+  fi
+done
+cmp -s adapters/BluetoothBackendAdapter.qml \
+  hancore.shibumi.bluetooth/BluetoothBackendAdapter.qml \
+  || fail "root and plugin Bluetooth adapters drifted"
+cmp -s adapters/BluetoothModel.js hancore.shibumi.bluetooth/BluetoothModel.js \
+  || fail "root and plugin Bluetooth models drifted"
+cmp -s adapters/BluetoothDiscoveryGuard.qml \
+  hancore.shibumi.bluetooth/BluetoothDiscoveryGuard.qml \
+  || fail "root and plugin Bluetooth discovery guards drifted"
+for bluetooth_service in \
+  services/BluetoothService.qml \
+  hancore.shibumi.bluetooth/Service.qml; do
+  rg -U -q 'id: discoveryRetry[^}]*repeat: true[^}]*running: root\.sessionCount > 0 && root\.adapterAvailable[^}]*root\.radioEnabled && !root\.discovering' \
+    "$bluetooth_service" \
+    || fail "$bluetooth_service does not bound discovery retries to an open session"
+done
+if rg -q 'registeredWidget|registeredSource|registeredComponent|panelSource|panelComponent|Loader \{' \
+    services/BluetoothService.qml hancore.shibumi.bluetooth/Service.qml; then
+  fail "Bluetooth service still resolves or loads the complete Omarchy panel"
+fi
 if rg -q 'Quickshell\.Bluetooth|Quickshell\.Services\.Pipewire|Bluetooth\.|Pipewire\.' \
   widgets/BluetoothWidget.qml widgets/BluetoothPanel.qml \
-  services/BluetoothService.qml adapters/BluetoothPanelBridge.qml; then
-  fail "Shibumi bluetooth presentation must not create a second Bluetooth owner"
+  services/BluetoothService.qml; then
+  fail "Bluetooth presentation bypasses the process-wide native adapter"
 fi
 if rg -q 'Process \{|Timer \{|FileView \{' widgets/BluetoothWidget.qml \
-  widgets/BluetoothPanel.qml services/BluetoothService.qml \
-  adapters/BluetoothPanelBridge.qml; then
-  fail "Bluetooth presentation and service facade must remain worker-free"
+    widgets/BluetoothPanel.qml; then
+  fail "Bluetooth presentation must remain worker-free"
+fi
+if rg -q 'Process \{|FileView \{' services/BluetoothService.qml; then
+  fail "Bluetooth service facade must remain process- and file-worker-free"
+fi
+if rg -q 'Process \{|FileView \{' adapters/BluetoothBackendAdapter.qml \
+    hancore.shibumi.bluetooth/BluetoothBackendAdapter.qml; then
+  fail "Bluetooth native adapter uses a worker instead of native APIs"
 fi
 rg -q 'childPanelWidget\("omarchy\.bluetooth"\)' tests/bluetooth-widget-smoke.qml \
   || fail "Bluetooth alias routing is not regression-tested"
@@ -854,15 +920,13 @@ if find . -path ./.git -prune -o -type l -print -quit | grep -q .; then
   fail "plugin payload contains a symlink"
 fi
 
-if [[ -n ${OMARCHY_PATH:-} && -x ${OMARCHY_PATH}/bin/omarchy-plugin-validate ]]; then
-  if "${OMARCHY_PATH}/bin/omarchy-plugin-validate" "$repo_root" >/dev/null 2>&1; then
-    fail "repository root unexpectedly passes the single-plugin validator"
-  fi
-  while IFS= read -r plugin_id; do
-    [[ -d $repo_root/$plugin_id ]] || continue
-    "${OMARCHY_PATH}/bin/omarchy-plugin-validate" "$repo_root/$plugin_id"
-  done < <(jq -r '.plugins[].id' contracts/plugin-suite-v1.json)
+if "${OMARCHY_PATH}/bin/omarchy-plugin-validate" "$repo_root" >/dev/null 2>&1; then
+  fail "repository root unexpectedly passes the single-plugin validator"
 fi
+while IFS= read -r plugin_id; do
+  [[ -d $repo_root/$plugin_id ]] || continue
+  "${OMARCHY_PATH}/bin/omarchy-plugin-validate" "$repo_root/$plugin_id"
+done < <(jq -r '.plugins[].id' contracts/plugin-suite-v1.json)
 
 "$repo_root/tests/style-contract-regression.sh"
 "$repo_root/tests/picker-helper-regression.sh"
@@ -905,33 +969,33 @@ QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qml \
 
 "$repo_root/tests/health-diagnostics-regression.sh"
 "$repo_root/tests/plugin-update-selector-regression.sh"
+"$repo_root/tests/audio-network-ipc-contract-regression.sh"
+"$repo_root/tests/network-ipc-routing-regression.sh"
+"$repo_root/tests/third-party-integration-regression.sh"
 
-if [[ -x /usr/bin/quickshell ]]; then
-  quote_smoke_root=$(mktemp -d)
-  mkdir -p "$quote_smoke_root/services" "$quote_smoke_root/runtime" \
-    "$quote_smoke_root/home"
-  chmod 700 "$quote_smoke_root/runtime"
-  cp services/QuoteDefaults.js services/ReactorModel.js \
-    services/QuoteService.qml "$quote_smoke_root/services/"
-  cp tests/quote-service-smoke.qml "$quote_smoke_root/shell.qml"
-  set +e
-  quote_service_output=$(timeout 4 env \
-    HOME="$quote_smoke_root/home" \
-    QT_QPA_PLATFORM=offscreen \
-    XDG_RUNTIME_DIR="$quote_smoke_root/runtime" \
-    /usr/bin/quickshell -p "$quote_smoke_root" 2>&1)
-  quote_service_rc=$?
-  set -e
-  rm -rf -- "$quote_smoke_root"
-  printf '%s\n' "$quote_service_output"
-  [[ $quote_service_rc -eq 0 ]] \
-    || fail "quote service smoke exited $quote_service_rc"
-  grep -q 'quote service smoke passed' <<<"$quote_service_output" \
-    || fail "quote service smoke did not emit its first quote"
-fi
+quote_smoke_root=$(mktemp -d)
+mkdir -p "$quote_smoke_root/services" "$quote_smoke_root/runtime" \
+  "$quote_smoke_root/home"
+chmod 700 "$quote_smoke_root/runtime"
+cp services/QuoteDefaults.js services/ReactorModel.js \
+  services/QuoteService.qml "$quote_smoke_root/services/"
+cp tests/quote-service-smoke.qml "$quote_smoke_root/shell.qml"
+set +e
+quote_service_output=$(timeout 4 env \
+  HOME="$quote_smoke_root/home" \
+  QT_QPA_PLATFORM=offscreen \
+  XDG_RUNTIME_DIR="$quote_smoke_root/runtime" \
+  /usr/bin/quickshell -p "$quote_smoke_root" 2>&1)
+quote_service_rc=$?
+set -e
+rm -rf -- "$quote_smoke_root"
+printf '%s\n' "$quote_service_output"
+[[ $quote_service_rc -eq 0 ]] \
+  || fail "quote service smoke exited $quote_service_rc"
+grep -q 'quote service smoke passed' <<<"$quote_service_output" \
+  || fail "quote service smoke did not emit its first quote"
 
-if [[ -n ${OMARCHY_PATH:-} && -d ${OMARCHY_PATH}/shell && -x /usr/bin/quickshell ]]; then
-  OMARCHY_PATH="$OMARCHY_PATH" "$repo_root/tests/state-service-regression.sh"
+OMARCHY_PATH="$OMARCHY_PATH" "$repo_root/tests/state-service-regression.sh"
   OMARCHY_PATH="$OMARCHY_PATH" "$repo_root/tests/theme-palette-runtime-regression.sh"
   OMARCHY_PATH="$OMARCHY_PATH" "$repo_root/tests/control-center-regression.sh"
   OMARCHY_PATH="$OMARCHY_PATH" "$repo_root/tests/telemetry-plugins-regression.sh"
@@ -950,6 +1014,7 @@ if [[ -n ${OMARCHY_PATH:-} && -d ${OMARCHY_PATH}/shell && -x /usr/bin/quickshell
   OMARCHY_PATH="$OMARCHY_PATH" "$repo_root/tests/quick-access-plugin-regression.sh"
   OMARCHY_PATH="$OMARCHY_PATH" "$repo_root/tests/reactor-plugin-regression.sh"
   OMARCHY_PATH="$OMARCHY_PATH" "$repo_root/tests/bar-host-registry-regression.sh"
+  "$repo_root/tests/window-recovery-regression.sh"
 
   official_audio_panel=${OMARCHY_PATH}/shell/plugins/panels/audio/Panel.qml
   [[ -s $official_audio_panel ]] || fail "official Quattro audio panel is missing"
@@ -981,15 +1046,6 @@ if [[ -n ${OMARCHY_PATH:-} && -d ${OMARCHY_PATH}/shell && -x /usr/bin/quickshell
     enabledDisplayCount toggleDisplay normalizeScale brightnessName; do
     rg -q "${monitor_contract}" "$official_monitor_panel" \
       || fail "official monitor panel contract changed: $monitor_contract"
-  done
-  official_bluetooth_panel=${OMARCHY_PATH}/shell/plugins/panels/bluetooth/Panel.qml
-  [[ -s $official_bluetooth_panel ]] \
-    || fail "official Quattro bluetooth panel is missing"
-  for bluetooth_contract in adapter connectedDevices knownDevices discoveredDevices \
-    toggleBluetooth connectDevice disconnectDevice forgetDevice pendingAction \
-    deviceLabel open close; do
-    rg -q "${bluetooth_contract}" "$official_bluetooth_panel" \
-      || fail "official bluetooth panel contract changed: $bluetooth_contract"
   done
   official_power_panel=${OMARCHY_PATH}/shell/plugins/panels/power/Panel.qml
   [[ -s $official_power_panel ]] || fail "official Quattro power panel is missing"
@@ -1273,10 +1329,12 @@ if [[ -n ${OMARCHY_PATH:-} && -d ${OMARCHY_PATH}/shell && -x /usr/bin/quickshell
   [[ $(<"$smoke_root/power-state") == performance ]] \
     || fail "power service did not execute the exact validated profile action"
 
-  cp adapters/BluetoothPanelBridge.qml "$smoke_root/adapters/"
+  cp adapters/BluetoothBackendAdapter.qml adapters/BluetoothModel.js \
+    adapters/BluetoothDiscoveryGuard.qml adapters/qmldir \
+    "$smoke_root/adapters/"
   cp services/BluetoothService.qml "$smoke_root/services/"
   cp widgets/BluetoothWidget.qml widgets/BluetoothPanel.qml "$smoke_root/widgets/"
-  cp tests/fixtures/BluetoothTestPanel.qml \
+  cp tests/fixtures/BluetoothTestBackend.qml \
     tests/fixtures/BluetoothTestView.qml "$smoke_root/fixtures/"
   cp tests/bluetooth-widget-smoke.qml "$smoke_root/shell.qml"
   set +e
@@ -1425,6 +1483,5 @@ if [[ -n ${OMARCHY_PATH:-} && -d ${OMARCHY_PATH}/shell && -x /usr/bin/quickshell
     fail "workspace panel smoke has an undefined control appearance token"
   fi
 
-fi
-
-printf 'Shibumi contract regression passed\n'
+printf 'Shibumi complete contract regression passed (Omarchy baseline %s; source %s)\n' \
+  "$SHIBUMI_OMARCHY_BASELINE_ID" "$SHIBUMI_OMARCHY_SOURCE_REVISION"

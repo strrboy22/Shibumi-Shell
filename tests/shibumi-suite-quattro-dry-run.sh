@@ -3,7 +3,9 @@
 set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-omarchy_path=${OMARCHY_PATH:-}
+source "$repo_root/tests/lib/baselines.sh"
+shibumi_load_omarchy_baseline
+omarchy_path=$OMARCHY_PATH
 
 fail() {
   printf 'Shibumi suite Quattro dry-run failed: %s\n' "$*" >&2
@@ -28,7 +30,7 @@ output=$(env \
   "$repo_root/scripts/shibumi-suite" install --dry-run)
 
 printf '%s\n' "$output"
-grep -q 'plugins:[[:space:]]*25' <<<"$output" \
+grep -q 'plugins:[[:space:]]*24' <<<"$output" \
   || fail 'dry-run did not validate the complete suite'
 grep -q 'Dry run complete; no files changed.' <<<"$output" \
   || fail 'dry-run completion marker is missing'

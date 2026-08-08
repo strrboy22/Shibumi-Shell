@@ -40,7 +40,7 @@ These premises apply to every implementation, review, and release decision.
   product, an official Omarchy bar, or a Basecamp-maintained plugin.
 - Shibumi may port approved host-neutral behavior from QS Rise V1. The products
   do not share deployment paths, update state, or platform ownership code.
-- This repository contains 25 independently registered runtime plugins. A
+- This repository contains 24 independently registered runtime plugins. A
   transactional suite adapter bridges Quattro's current one-repository to
   one-plugin installation limit.
 - Future Shibumi bars use separate `bar` plugin IDs and reuse the same feature
@@ -658,16 +658,21 @@ Current Phase 2 foundation:
   available on batteryless desktops. the validation system passes a real
   discharging-to-charging transition with matching kernel, UPower, helper,
   widget, and panel state.
-- G15 has one root-owned `BluetoothService` around the registered
-  `omarchy.bluetooth` component. That hidden component remains the only BlueZ,
-  pairing, device-action, and Bluetooth-audio sink owner, with its stock button,
-  popup, and IPC handler suppressed;
+- G15 has one root-owned `BluetoothService` and one native
+  `BluetoothBackendAdapter`. The adapter owns Quickshell's BlueZ/PipeWire
+  models, pairing/device actions, pending state, and Bluetooth-audio handoff;
+  no complete Omarchy Bluetooth UI component is instantiated as a backend;
 - each output owns only its V1 Bluetooth presentation and lazy Shibumi device
   panel. The root service leases discovery across open panels and owns one
-  symmetric `omarchy.bluetooth` IPC target. The presentation/service slice has
-  no Bluetooth/PipeWire import, process, timer, or file watcher. Top mapping,
-  adapter/radio reactivity, discovery teardown, and IPC lifecycle pass on
-  the validation system; real device/audio, bottom, and physical multi-output gates remain.
+  symmetric six-method `omarchy.bluetooth` IPC target. Presentation has no
+  Bluetooth/PipeWire import, process, timer, or file watcher; the service facade
+  owns one bounded discovery-reconciliation timer and the adapter owns four
+  bounded lifecycle timers. While a requested Discovery start is still pending
+  during teardown, at most one temporary 30-second retry/expiry timer per
+  native adapter survives the facade. Top mapping, adapter/radio
+  reactivity, discovery ownership/teardown, both backend load orders, and IPC
+  lifecycle pass on the validation system; real device/audio, bottom, and
+  physical multi-output gates remain.
 - the interaction foundation has a pure fixed-group layout model, one
   root-owned persistent controller, and one transient drag session per output;
 - the group renderer resolves Shibumi and official Quattro widgets without
@@ -775,7 +780,7 @@ cleaner Shibumi architecture alone is not sufficient justification.
 
 ### Lifecycle
 
-- The official `omarchy plugin validate` command passes for every one of the 25
+- The official `omarchy plugin validate` command passes for every one of the 24
   child plugin roots.
 - The repository root has no `manifest.json`; native
   `omarchy plugin add <repository>` must fail instead of installing a partial

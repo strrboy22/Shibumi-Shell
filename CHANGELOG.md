@@ -2,6 +2,72 @@
 
 This changelog records user-visible Shibumi changes.
 
+## 0.1.1-beta.7: Network label stability
+
+Release candidate for 2026-08-07.
+
+### Fixed
+
+- Measured bounded Network labels independently from their rendered width, preventing V2 Wi-Fi and shared text-mode binding loops
+- Covered Wi-Fi transitions across V1 and V2 full, icon, and text modes, including long bounded labels
+
+### Known limits
+
+- Physical mixed-scale multi-monitor, enterprise Wi-Fi, remaining device-backed Bluetooth, clean-chroot packaging, and safe nested-compositor lifecycle acceptance remain external stable gates
+- AUR publication remains unavailable until the package name can be registered
+
+## 0.1.1-beta.6: Stable-readiness lifecycle hardening
+
+Release candidate for 2026-08-07.
+
+### Changed
+
+- Classified stable GitHub releases independently from prereleases with validated SemVer handling
+- Restored the exact saved Omarchy layout when first returning from Shibumi
+- Made unavailable Quickshell logs an explicit Health warning instead of a false clean result
+- Corrected current installation and architecture documentation to the 24-plugin contract
+
+### Fixed
+
+- Published suite and continuity-manager recovery transactions only after complete durable preparation
+- Serialized continuity recovery with active bar-switch workers
+- Persisted journals, staged payloads, namespace renames, configuration, install state, backup archives, and cleanup in crash-safe order
+- Rejected malformed, incomplete, or symlinked recovery state before changing live files or stopping the shell
+- Made interrupted transaction preparation, archive copying, and cleanup automatically resumable
+- Waited for an authoritative stock-shell ping and isolated lifecycle-evidence restarts and compositor probes from the production session
+- Prevented hidden official Audio and Network keyboard panels from flashing stock Omarchy UI before Shibumi compatibility redirects settle
+
+### Known limits
+
+- Physical mixed-scale multi-monitor, enterprise Wi-Fi, remaining device-backed Bluetooth, clean-chroot packaging, and safe nested-compositor lifecycle acceptance remain external stable gates
+- AUR publication remains unavailable until the package name can be registered
+
+## 0.1.1-beta.5: Contract and recovery hardening
+
+Release candidate for 2026-08-07.
+
+### Changed
+
+- Made Omarchy and predecessor baseline identity checks deterministic across C and UTF-8 locales
+- Bound release promotion to revision-specific lifecycle, host, and checksummed command evidence
+- Kept third-party plugin updates behind Omarchy's authoritative changed-code review prompt
+
+### Fixed
+
+- Retained transaction journals and snapshots when rollback itself fails, allowing later recovery
+- Excluded generated Python caches consistently from source staging, payload hashing, and provenance
+- Reported retired plugin state without crashing `shibumi-shell status`
+- Restarted the shell at the managed repair ownership boundary instead of hot-reloading a replaced bar provider
+- Kept popout and connected-panel ownership independent across physical outputs
+- Preserved declarative bar visibility after layer-window recovery
+- Restored Calendar and Power compatibility routing for the installed Omarchy shortcuts
+- Restored the process-wide Audio IPC owner and deliberate Network IPC presentation redirects
+
+### Known limits
+
+- Physical mixed-scale multi-monitor, enterprise Wi-Fi, and remaining device-backed Bluetooth acceptance stay explicit external gates
+- AUR publication remains unavailable until the package name can be registered
+
 ## 0.1.1-beta.4: Shell and lifecycle stabilization
 
 Release candidate for 2026-08-04.

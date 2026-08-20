@@ -24,6 +24,10 @@ Item {
   property string actionGlyph: ""
   property string secondaryActionLabel: ""
   property string secondaryActionGlyph: ""
+  property bool secondaryActionEnabled: true
+  property string secondaryActionStatusText: ""
+  property string secondaryActionDescription: ""
+  property color secondaryActionStatusColor: foreground
   signal actionRequested()
   signal secondaryActionRequested()
 
@@ -159,6 +163,7 @@ Item {
       }
 
       Rectangle {
+        id: secondaryAction
         anchors.right: parent.right
         anchors.top: primaryAction.bottom
         anchors.topMargin: Commons.Style.space(6)
@@ -170,7 +175,16 @@ Item {
           ? root.controller.controlHoverFillColor
           : root.controller.controlFillColor
         border.width: root.controller.controlBorderWidth
-        border.color: root.controller.controlBorderColor
+        border.color: activeFocus ? root.accent
+          : root.controller.controlBorderColor
+        enabled: root.secondaryActionEnabled
+        opacity: enabled ? 1 : 0.62
+        activeFocusOnTab: enabled
+        Accessible.role: Accessible.Button
+        Accessible.name: root.secondaryActionLabel
+        Accessible.description: root.secondaryActionDescription
+        Accessible.onPressAction: if (root.secondaryActionEnabled)
+          root.secondaryActionRequested()
 
         Row {
           anchors.left: parent.left
@@ -203,13 +217,46 @@ Item {
           }
         }
 
+        ShibumiPanelToolTip {
+          panel: root.controller
+          visible: secondaryPointer.containsMouse
+            && root.secondaryActionDescription !== ""
+          text: root.secondaryActionDescription
+        }
+
         MouseArea {
           id: secondaryPointer
           anchors.fill: parent
           hoverEnabled: true
-          cursorShape: Qt.PointingHandCursor
+          enabled: root.secondaryActionEnabled
+          cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
           onClicked: root.secondaryActionRequested()
         }
+
+        Keys.onReturnPressed: if (root.secondaryActionEnabled)
+          root.secondaryActionRequested()
+        Keys.onEnterPressed: if (root.secondaryActionEnabled)
+          root.secondaryActionRequested()
+        Keys.onSpacePressed: if (root.secondaryActionEnabled)
+          root.secondaryActionRequested()
+      }
+
+      Text {
+        anchors.top: secondaryAction.bottom
+        anchors.topMargin: Commons.Style.space(2)
+        anchors.horizontalCenter: secondaryAction.horizontalCenter
+        visible: secondaryAction.visible
+          && root.secondaryActionStatusText !== ""
+        width: secondaryAction.width
+        text: root.secondaryActionStatusText
+        color: root.secondaryActionStatusColor
+        opacity: 0.68
+        elide: Text.ElideRight
+        horizontalAlignment: Text.AlignHCenter
+        font.family: root.controller.marketFont
+        font.pixelSize: Commons.Style.font.caption * root.uiScale
+        font.weight: Font.Medium
+        renderType: Text.NativeRendering
       }
     }
   }

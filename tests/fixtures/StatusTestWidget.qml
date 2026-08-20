@@ -10,6 +10,9 @@ Item {
   property string moduleName: ""
   property var settings: ({})
   property color contentColor: "transparent"
+  property bool customToneActive: false
+  property color badgeContrastColor: "transparent"
+  readonly property real badgeLayer: 10
   property bool updateAvailable: true
   property bool popupOpen: false
   property bool managePopupOpen: false

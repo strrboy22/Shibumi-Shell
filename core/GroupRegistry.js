@@ -40,6 +40,7 @@ var OptionalGroups = {
 var ConsumedAliases = [
   "omarchy.menu",
   "omarchy.workspaces",
+  "omarchy.agents",
   "omarchy.model-usage",
   "omarchy.audio",
   "omarchy.media",
@@ -163,9 +164,16 @@ function moduleIdsFor(groupValue, layout) {
   if (GroupIds.indexOf(groupId) < 0) return []
   var result = (BaseEntries[groupId] || []).slice()
   var configured = configuredEntries(layout)
+  var explicitlyInstalled = {}
   for (var i = 0; i < configured.length; i++) {
-    var optionalId = configured[i].id
+    if (isObject(configured[i].entry)
+        && configured[i].entry.shibumiModule === true)
+      explicitlyInstalled[configured[i].id] = true
+  }
+  for (var j = 0; j < configured.length; j++) {
+    var optionalId = configured[j].id
     if (OptionalGroups[optionalId] === groupId
+        && explicitlyInstalled[optionalId] !== true
         && result.indexOf(optionalId) < 0) result.push(optionalId)
   }
   return result
@@ -188,6 +196,21 @@ function entryFor(groupValue, moduleValue, groupValueSettings, layout) {
     groupSettings(groupValueSettings, id, ids.length))
 }
 
+// WidgetSlot needs explicit host and group-local layers so an inline host-state
+// write can preserve equal-valued overrides and survive consecutive updates.
+function hostEntryFor(moduleValue, layout) {
+  var id = String(moduleValue || "")
+  var entry = configuredEntry(layout, id)
+  return entry !== null ? entry : { id: id }
+}
+
+function settingsOverridesFor(groupValue, moduleValue, groupValueSettings,
+    layout) {
+  var id = String(moduleValue || "")
+  var ids = moduleIdsFor(groupValue, layout)
+  return groupSettings(groupValueSettings, id, ids.length)
+}
+
 function assignedModuleIds() {
   var result = []
   for (var i = 0; i < GroupIds.length; i++) {
@@ -200,6 +223,11 @@ function assignedModuleIds() {
     if (result.indexOf(optionalId) < 0) result.push(optionalId)
   }
   return result
+}
+
+function isOptionalModule(moduleValue) {
+  return Object.prototype.hasOwnProperty.call(
+    OptionalGroups, String(moduleValue || ""))
 }
 
 function isAssignedModule(moduleValue) {

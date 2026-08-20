@@ -14,6 +14,7 @@ ShibumiPanel {
   required property var stateService
   required property var healthService
   required property var switchService
+  property var pluginUpdateService: null
   // Compatibility aliases for the Control Center views. Their provenance is
   // the active host's VisualTokens, which ultimately follow colors.toml.
   readonly property color marketBackground: shibumiTokens
@@ -58,6 +59,10 @@ ShibumiPanel {
     return effective
   }
   readonly property var workspaceConfig: stateConfig.workspace || ({})
+  readonly property var layoutProtection: stateConfig.layoutProtection
+    || ({ v1: false, v2: false })
+  readonly property bool v1LayoutProtected: layoutProtection.v1 === true
+  readonly property bool v2LayoutProtected: layoutProtection.v2 === true
   readonly property var pluginConfig: stateConfig.plugins || ({})
   readonly property var pluginFavorites: Array.isArray(pluginConfig.favorites)
     ? pluginConfig.favorites : []
@@ -118,14 +123,34 @@ ShibumiPanel {
       return entry.compatibility !== "Native" && entry.enabled
     }).length
   readonly property bool pluginRemovalRunning: pluginRemoval.running
+  readonly property bool pluginUpdateCheckRunning:
+    effectivePluginUpdateService
+      ? effectivePluginUpdateService.running === true : false
+  readonly property int pluginUpdateCount: effectivePluginUpdateService
+    ? Number(effectivePluginUpdateService.updateCount || 0) : 0
+  readonly property int pluginUpdateFailedCount: effectivePluginUpdateService
+    ? Number(effectivePluginUpdateService.failedCount || 0) : 0
+  readonly property string pluginUpdateCheckError: effectivePluginUpdateService
+    ? String(effectivePluginUpdateService.error || "") : ""
+  readonly property string pluginUpdateShortStatusText:
+    effectivePluginUpdateService
+      ? String(effectivePluginUpdateService.shortStatusText || "") : ""
+  readonly property string pluginUpdateStatusText: effectivePluginUpdateService
+    ? String(effectivePluginUpdateService.statusText || "")
+    : "Plugin update check unavailable"
   readonly property string pluginRemovalId: removalPluginId
   property string removalPluginId: ""
+  property bool removalPluginWasInBar: false
+  property var removalReplacementGroups: []
   property string pluginActionError: ""
   signal pluginRemovalFinished(
     string pluginId, bool success, string detail)
   readonly property string managerCommand: Quickshell.env("HOME")
     + "/.config/omarchy/plugins/hancore.shibumi.control-center"
     + "/manager/shibumi-manager"
+  readonly property var effectivePluginUpdateService: pluginUpdateService
+    || (bar && bar.shell && typeof bar.shell.serviceFor === "function"
+      ? bar.shell.serviceFor("hancore.shibumi.control-center") : null)
   readonly property string pluginUpdateCommand: Quickshell.env("HOME")
     + "/.config/omarchy/plugins/hancore.shibumi.control-center"
     + "/manager/shibumi-plugin-updates"
@@ -232,6 +257,9 @@ ShibumiPanel {
           switchPhase === "error" ? 488 : 436), Commons.Style.space(495))
     : settings.compactConfigureLanding
       ? fittedContentHeight(settings.compactConfigureLandingPanelHeight,
+          Commons.Style.space(680))
+    : settings.compactBarsPage
+      ? fittedContentHeight(settings.compactBarsPanelHeight,
           Commons.Style.space(680))
     : settings.compactIconsOverview
       ? fittedContentHeight(settings.compactIconsPanelHeight,
@@ -394,12 +422,30 @@ ShibumiPanel {
       const suiteManaged = String(shibumi.suiteId || "")
         === "hancore.shibumi"
       const group = shibumiWidgetGroup(id)
-      const replacementGroup = group === "" && bar
-        && typeof bar.widgetReplacementGroup === "function"
-        ? bar.widgetReplacementGroup(id) : ""
+      const replacementGroups = group === "" && bar
+        && typeof bar.widgetReplacementGroups === "function"
+        ? bar.widgetReplacementGroups(id)
+        : group === "" && bar
+          && typeof bar.widgetReplacementGroup === "function"
+          ? [bar.widgetReplacementGroup(id)].filter(function(value) {
+              return String(value || "") !== ""
+            }) : []
+      const replacementGroup = replacementGroups.length > 0
+        ? String(replacementGroups[0] || "") : ""
       const replacementTargetId = group === "" && bar
         && typeof bar.widgetReplacementTarget === "function"
         ? bar.widgetReplacementTarget(id) : ""
+      const replacementTargetStates = groupVariantStates(replacementGroups)
+      const conflictingProviderIds = group === "" && bar
+        && typeof bar.conflictingLayoutProviderIds === "function"
+        ? bar.conflictingLayoutProviderIds(id).filter(function(candidateId) {
+            return String(candidateId || "") !== id
+          }) : []
+      const conflictingProviderGroups = group === "" && bar
+        && typeof bar.conflictingLayoutProviderGroups === "function"
+        ? bar.conflictingLayoutProviderGroups(id) : []
+      const conflictingProviderStates = groupVariantStates(
+        replacementGroups.concat(conflictingProviderGroups))
       const replacementTargetManifest =
         installed[String(replacementTargetId || "")] || ({})
       const replacementTarget = replacementTargetId !== ""
@@ -461,10 +507,16 @@ ShibumiPanel {
           ? bar.widgetReplacementLabel(id) : "",
         group: group,
         replacementGroup: replacementGroup,
+        replacementGroups: replacementGroups,
         replacementTargetId: replacementTargetId,
         replacementTarget: replacementTarget,
-        replacementTargetEnabled: replacementGroup !== ""
-          && groupEnabled(replacementGroup),
+        replacementTargetStates: replacementTargetStates,
+        conflictingProviderIds: conflictingProviderIds,
+        conflictingProviderStates: conflictingProviderStates,
+        replacementTargetEnabled: replacementGroups.some(function(groupId) {
+          const states = replacementTargetStates[groupId] || ({})
+          return states.v1 === true || states.v2 === true
+        }),
         replacementInEffect: false,
         replaced: false,
         replacedBy: "",
@@ -475,19 +527,31 @@ ShibumiPanel {
     const activeReplacements = {}
     for (let index = 0; index < result.length; index++) {
       const entry = result[index]
-      const replacementGroup = String(entry.replacementGroup || "")
-      if (replacementGroup === "" || entry.installedInBar !== true) continue
-      if (!activeReplacements[replacementGroup])
-        activeReplacements[replacementGroup] = []
-      activeReplacements[replacementGroup].push(entry)
+      const replacementGroups = Array.isArray(entry.replacementGroups)
+        ? entry.replacementGroups : []
+      if (replacementGroups.length === 0
+          || entry.installedInBar !== true) continue
+      for (let groupIndex = 0; groupIndex < replacementGroups.length;
+           groupIndex++) {
+        const replacementGroup = String(replacementGroups[groupIndex] || "")
+        if (replacementGroup === "") continue
+        if (!activeReplacements[replacementGroup])
+          activeReplacements[replacementGroup] = []
+        activeReplacements[replacementGroup].push(entry)
+      }
     }
     for (let index = 0; index < result.length; index++) {
       const entry = result[index]
       const group = String(entry.group || "")
-      const replacementGroup = String(entry.replacementGroup || "")
-      if (replacementGroup !== "") {
+      const replacementGroups = Array.isArray(entry.replacementGroups)
+        ? entry.replacementGroups : []
+      if (replacementGroups.length > 0) {
+        const targetStates = entry.replacementTargetStates || ({})
         entry.replacementInEffect = entry.installedInBar === true
-          && !groupEnabled(replacementGroup)
+          && replacementGroups.every(function(groupId) {
+            const states = targetStates[groupId] || ({})
+            return states.v1 === false && states.v2 === false
+          })
         continue
       }
       const replacements = activeReplacements[group] || []
@@ -542,9 +606,19 @@ ShibumiPanel {
               : "The plugin could not be removed from the V1 layout."
           return changed
         }
+        const alternativesInstalled = enabled === true && bar
+          && typeof bar.widgetFamilyAlternativesInstalled === "function"
+          && bar.widgetFamilyAlternativesInstalled(group)
+        if (alternativesInstalled
+            && typeof bar.restoreWidgetFamilyProviders === "function")
+          return bar.restoreWidgetFamilyProviders([group])
+        let removedAlternative = false
         if (enabled === true && bar
             && typeof bar.removeWidgetFamilyAlternatives === "function")
-          bar.removeWidgetFamilyAlternatives(group)
+          removedAlternative = bar.removeWidgetFamilyAlternatives(group)
+        if (removedAlternative && bar
+            && typeof bar.setWidgetGroupsEnabledForAllVariants === "function")
+          return bar.setWidgetGroupsEnabledForAllVariants([group], true)
         return setGroupEnabled(group, enabled === true)
       }
       if (suiteManaged) {
@@ -582,13 +656,102 @@ ShibumiPanel {
     })
   }
 
-  function restoreShibumiProvider(groupId) {
-    const group = String(groupId || "")
-    if (group === "" || !bar
+  function restoreShibumiProviders(groupValues) {
+    if (!Array.isArray(groupValues) || !bar
         || typeof bar.removeWidgetFamilyAlternatives !== "function")
       return false
-    bar.removeWidgetFamilyAlternatives(group)
-    return setGroupEnabled(group, true)
+    const groups = []
+    for (let index = 0; index < groupValues.length; index++) {
+      const group = String(groupValues[index] || "")
+      if (group !== "" && groups.indexOf(group) < 0) groups.push(group)
+    }
+    if (groups.length === 0) return false
+    if (typeof bar.restoreWidgetFamilyProviders === "function")
+      return bar.restoreWidgetFamilyProviders(groups)
+    for (let index = 0; index < groups.length; index++)
+      bar.removeWidgetFamilyAlternatives(groups[index])
+    if (typeof bar.setWidgetGroupsEnabledForAllVariants === "function")
+      return bar.setWidgetGroupsEnabledForAllVariants(groups, true)
+    let restored = true
+    for (let index = 0; index < groups.length; index++)
+      restored = setGroupEnabled(groups[index], true) && restored
+    return restored
+  }
+
+  function restoreShibumiProviderStates(stateValues) {
+    if (!stateValues || typeof stateValues !== "object" || !bar
+        || typeof bar.removeWidgetFamilyAlternatives !== "function")
+      return false
+    const groups = Object.keys(stateValues)
+    if (groups.length === 0) return false
+    for (let index = 0; index < groups.length; index++) {
+      const states = stateValues[groups[index]]
+      if (!states || typeof states.v1 !== "boolean"
+          || typeof states.v2 !== "boolean") return false
+    }
+    if (typeof bar.restoreWidgetFamilyProviderStates === "function")
+      return bar.restoreWidgetFamilyProviderStates(stateValues)
+    for (let index = 0; index < groups.length; index++)
+      bar.removeWidgetFamilyAlternatives(groups[index])
+    if (typeof bar.setWidgetGroupVariantStates === "function")
+      return bar.setWidgetGroupVariantStates(stateValues)
+    return restoreShibumiProviders(groups)
+  }
+
+  function providerUndoSnapshot(pluginId) {
+    const id = String(pluginId || "")
+    if (id === "" || !bar
+        || typeof bar.providerLayoutSnapshot !== "function") return null
+    const groups = []
+    const nativeGroup = shibumiWidgetGroup(id)
+    if (nativeGroup !== "") {
+      groups.push(nativeGroup)
+      if (typeof bar.widgetFamilyAlternativeIds === "function"
+          && typeof bar.widgetReplacementGroups === "function") {
+        const alternatives = bar.widgetFamilyAlternativeIds([nativeGroup])
+        for (let index = 0; index < alternatives.length; index++) {
+          const alternativeId = alternatives[index]
+          if (typeof bar.layoutContains === "function"
+              && !bar.layoutContains(alternativeId)) continue
+          const alternativeGroups = bar.widgetReplacementGroups(alternativeId)
+          for (let groupIndex = 0;
+               groupIndex < alternativeGroups.length; groupIndex++) {
+            if (groups.indexOf(alternativeGroups[groupIndex]) < 0)
+              groups.push(alternativeGroups[groupIndex])
+          }
+        }
+      }
+    } else {
+      const replacementGroups = typeof bar.widgetReplacementGroups
+        === "function" ? bar.widgetReplacementGroups(id) : []
+      const conflictGroups = typeof bar.conflictingLayoutProviderGroups
+        === "function" ? bar.conflictingLayoutProviderGroups(id) : []
+      const affectedGroups = replacementGroups.concat(conflictGroups)
+      for (let index = 0; index < affectedGroups.length; index++) {
+        if (groups.indexOf(affectedGroups[index]) < 0)
+          groups.push(affectedGroups[index])
+      }
+    }
+    return groups.length > 0 ? bar.providerLayoutSnapshot(groups) : null
+  }
+
+  function restoreProviderUndoSnapshot(snapshotValue) {
+    if (!snapshotValue || !bar
+        || typeof bar.restoreProviderLayoutSnapshot !== "function")
+      return false
+    return runWithControlCenterRestore(function() {
+      return bar.restoreProviderLayoutSnapshot(snapshotValue)
+    })
+  }
+
+  function setProviderGroupStates(stateValues) {
+    return stateValues && typeof stateValues === "object" && bar
+      && typeof bar.setWidgetGroupVariantStates === "function"
+      ? bar.setWidgetGroupVariantStates(stateValues) : false
+  }
+
+  function restoreShibumiProvider(groupId) {
+    return restoreShibumiProviders([String(groupId || "")])
   }
 
   function removePlugin(pluginId) {
@@ -606,6 +769,11 @@ ShibumiPanel {
       return false
     }
     removalPluginId = id
+    removalPluginWasInBar = entry.barWidget === true
+      && entry.installedInBar === true
+    removalReplacementGroups = removalPluginWasInBar
+      && Array.isArray(entry.replacementGroups)
+      ? entry.replacementGroups.slice() : []
     pluginRemoval.command = ["omarchy", "plugin", "remove", id, "--yes"]
     pluginRemoval.running = true
     return true
@@ -614,6 +782,8 @@ ShibumiPanel {
   function rescanPlugins() {
     if (!pluginRegistry
         || typeof pluginRegistry.rescan !== "function") return false
+    if (effectivePluginUpdateService)
+      effectivePluginUpdateService.invalidate(false)
     pluginRegistry.rescan()
     return true
   }
@@ -627,12 +797,33 @@ ShibumiPanel {
         ? stateService.groupSetting(groupId, key, fallback) : fallback
   }
 
-  function groupEnabled(groupId) {
+  function groupEnabledForVariant(groupId, variantValue) {
+    const variant = String(variantValue || "").toLowerCase()
+    if (["v1", "v2"].indexOf(variant) < 0) return false
     return stateService && typeof stateService.groupEnabledForVariant
       === "function"
-      ? stateService.groupEnabledForVariant(groupId,
-          v2LayoutActive ? "v2" : "v1")
+      ? stateService.groupEnabledForVariant(groupId, variant)
       : groupSetting(groupId, "enabled", true) !== false
+  }
+
+  function groupEnabled(groupId) {
+    return groupEnabledForVariant(
+      groupId, v2LayoutActive ? "v2" : "v1")
+  }
+
+  function groupVariantStates(groupValues) {
+    const source = Array.isArray(groupValues) ? groupValues : []
+    const states = ({})
+    for (let index = 0; index < source.length; index++) {
+      const group = String(source[index] || "")
+      if (group === "" || Object.prototype.hasOwnProperty.call(states, group))
+        continue
+      states[group] = {
+        v1: groupEnabledForVariant(group, "v1"),
+        v2: groupEnabledForVariant(group, "v2")
+      }
+    }
+    return states
   }
 
   function setGroupEnabled(groupId, enabled) {
@@ -681,18 +872,28 @@ ShibumiPanel {
     })
   }
 
+  function resetAllGroupAppearances(variantValue) {
+    const variant = String(variantValue || "").toLowerCase()
+    if (["v1", "v2"].indexOf(variant) < 0) return false
+    return runWithControlCenterRestore(function() {
+      return stateService
+        && typeof stateService.resetAllGroupAppearancesForVariant
+          === "function"
+        ? stateService.resetAllGroupAppearancesForVariant(variant) : false
+    })
+  }
+
   function runWithControlCenterRestore(callback) {
     if (typeof callback !== "function") return false
     const restoreBar = bar
-    const preservePage = settings.restorePage
-    if (restoreBar
-        && typeof restoreBar.scheduleWidgetRestore === "function")
-      restoreBar.scheduleWidgetRestore(
-        "hancore.shibumi.control-center", preservePage, true)
+    const created = restoreBar
+      && typeof restoreBar.scheduleOpenControlCenterRestores === "function"
+      ? restoreBar.scheduleOpenControlCenterRestores(
+          settings.restorePage, true, ownerWidget, popoutScreenName) : []
     const changed = callback()
     if (!changed && restoreBar
-        && typeof restoreBar.cancelWidgetRestore === "function")
-      restoreBar.cancelWidgetRestore("hancore.shibumi.control-center")
+        && typeof restoreBar.cancelCreatedWidgetRestores === "function")
+      restoreBar.cancelCreatedWidgetRestores(created)
     return changed
   }
 
@@ -706,19 +907,38 @@ ShibumiPanel {
       "accent", "border", "panelBorder", "frost", "shadow",
       "radius", "shellStyle"
     ].indexOf(presentationName) >= 0
-    const preservePage = settings.restorePage
     const restoreBar = bar
-    if (preservePanel && restoreBar
-        && typeof restoreBar.scheduleWidgetRestore === "function")
-      restoreBar.scheduleWidgetRestore(
-        "hancore.shibumi.control-center", preservePage,
-        presentationName === "shellStyle")
+    const created = preservePanel && restoreBar
+      && typeof restoreBar.scheduleOpenControlCenterRestores === "function"
+      ? restoreBar.scheduleOpenControlCenterRestores(
+          settings.restorePage, presentationName === "shellStyle",
+          ownerWidget, popoutScreenName) : []
     const changed = stateService
       && typeof stateService.setPresentationSetting === "function"
       ? stateService.setPresentationSetting(name, value) : false
-    if (!changed && preservePanel && restoreBar
-        && typeof restoreBar.cancelWidgetRestore === "function")
-      restoreBar.cancelWidgetRestore("hancore.shibumi.control-center")
+    if (!changed && restoreBar
+        && typeof restoreBar.cancelCreatedWidgetRestores === "function")
+      restoreBar.cancelCreatedWidgetRestores(created)
+    return changed
+  }
+
+  function setLayoutProtection(variant, enabled) {
+    const requested = String(variant || "").toLowerCase()
+    if (["v1", "v2"].indexOf(requested) < 0
+        || typeof enabled !== "boolean") return false
+    const restoreBar = bar
+    // A lock write republishes shell.json. Enroll every open output without
+    // downgrading an already-running V1/V2 replacement-owner handoff.
+    const created = restoreBar
+      && typeof restoreBar.scheduleOpenControlCenterRestores === "function"
+      ? restoreBar.scheduleOpenControlCenterRestores(
+          settings.restorePage, false, ownerWidget, popoutScreenName) : []
+    const changed = stateService
+      && typeof stateService.setLayoutProtection === "function"
+      ? stateService.setLayoutProtection(requested, enabled) : false
+    if (!changed && restoreBar
+        && typeof restoreBar.cancelCreatedWidgetRestores === "function")
+      restoreBar.cancelCreatedWidgetRestores(created)
     return changed
   }
 
@@ -727,16 +947,15 @@ ShibumiPanel {
     if (requested !== "v1" && requested !== "v2"
         || !stateService
         || typeof stateService.setShellVariant !== "function") return false
-    const preservePage = settings.restorePage
     const restoreBar = bar
-    if (restoreBar
-        && typeof restoreBar.scheduleWidgetRestore === "function")
-      restoreBar.scheduleWidgetRestore(
-        "hancore.shibumi.control-center", preservePage, true)
+    const created = restoreBar
+      && typeof restoreBar.scheduleOpenControlCenterRestores === "function"
+      ? restoreBar.scheduleOpenControlCenterRestores(
+          settings.restorePage, true, ownerWidget, popoutScreenName) : []
     const changed = stateService.setShellVariant(requested)
     if (!changed && restoreBar
-        && typeof restoreBar.cancelWidgetRestore === "function")
-      restoreBar.cancelWidgetRestore("hancore.shibumi.control-center")
+        && typeof restoreBar.cancelCreatedWidgetRestores === "function")
+      restoreBar.cancelCreatedWidgetRestores(created)
     return changed
   }
 
@@ -770,7 +989,7 @@ ShibumiPanel {
 
   function setBarPosition(value) {
     return bar && typeof bar.setBarPosition === "function"
-      ? bar.setBarPosition(value) : false
+      ? bar.setBarPosition(value, ownerWidget, popoutScreenName) : false
   }
 
   function setAllSplits(value) {
@@ -909,7 +1128,8 @@ ShibumiPanel {
       bar.clearControlCenterWidgetDetail()
     return bar && typeof bar.trackWidgetRestorePage === "function"
       ? bar.trackWidgetRestorePage(
-          "hancore.shibumi.control-center", page) : false
+          "hancore.shibumi.control-center", page,
+          ownerWidget, popoutScreenName) : false
   }
 
   function trackWidgetDetails(groupId, pluginId) {
@@ -944,8 +1164,15 @@ ShibumiPanel {
     return settings.openPluginInstaller()
   }
 
+  function checkPluginUpdates(force) {
+    if (stockOmarchyHost || !effectivePluginUpdateService) return false
+    return effectivePluginUpdateService.check(force === true)
+  }
+
   function openPluginUpdater() {
-    if (stockOmarchyHost) return false
+    if (stockOmarchyHost || pluginUpdateCheckRunning) return false
+    if (effectivePluginUpdateService)
+      effectivePluginUpdateService.invalidate(false)
     Quickshell.execDetached([
       "omarchy-launch-floating-terminal-with-presentation",
       pluginUpdateCommand
@@ -974,11 +1201,36 @@ ShibumiPanel {
         const id = panel.removalPluginId
         const output = String(
           removalStderr.text || removalStdout.text || "").trim()
-        const detail = output === "" ? ""
+        let detail = output === "" ? ""
           : output.split("\n").slice(-1)[0]
-        if (exitCode === 0) panel.rescanPlugins()
-        panel.pluginRemovalFinished(id, exitCode === 0, detail)
+        let success = exitCode === 0
+        if (success) {
+          let cleanupSucceeded = true
+          if (panel.removalPluginWasInBar && panel.bar) {
+            if (panel.removalReplacementGroups.length > 0
+                && typeof panel.bar.removeBarWidgetAndRestoreFamilies
+                  === "function") {
+              cleanupSucceeded = panel.bar.removeBarWidgetAndRestoreFamilies(
+                id, panel.removalReplacementGroups)
+            } else if (typeof panel.bar.setBarWidgetInstalled === "function") {
+              cleanupSucceeded = panel.bar.setBarWidgetInstalled(id, false, "")
+              if (cleanupSucceeded
+                  && panel.removalReplacementGroups.length > 0)
+                cleanupSucceeded = panel.restoreShibumiProviders(
+                  panel.removalReplacementGroups)
+            } else cleanupSucceeded = false
+          }
+          if (!cleanupSucceeded) {
+            success = false
+            detail = "Plugin removed, but bar provider cleanup failed."
+              + (detail !== "" ? " " + detail : "")
+          }
+          panel.rescanPlugins()
+        }
+        panel.pluginRemovalFinished(id, success, detail)
         panel.removalPluginId = ""
+        panel.removalPluginWasInBar = false
+        panel.removalReplacementGroups = []
       }
     }
   }
@@ -1039,16 +1291,15 @@ ShibumiPanel {
           }
         }
 
-        Text {
+        ActiveBarStatus {
           id: stateSync
           anchors.verticalCenter: parent.verticalCenter
-          text: panel.stockOmarchyHost
-            ? "●  OMARCHY BAR ACTIVE" : "●  STATE SYNCED"
-          color: panel.marketAccent
-          font.family: panel.bar
+          stockOmarchyHost: panel.stockOmarchyHost
+          v2LayoutActive: panel.v2LayoutActive
+          stateService: panel.stateService
+          neutralColor: panel.marketText
+          fontFamily: panel.bar
             ? panel.bar.fontFamily : Commons.Style.font.family
-          font.pixelSize: Commons.Style.font.caption
-          font.letterSpacing: 1.1
         }
 
         IconAction {

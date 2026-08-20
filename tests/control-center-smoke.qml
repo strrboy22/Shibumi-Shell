@@ -18,6 +18,12 @@ ShellRoot {
   property int healthLifecycleStep: 0
   property var lifecycleHealthService: null
   property int lifecycleReportEpoch: 0
+  property int activeBarStatusStep: 0
+  property bool statusStockHost: false
+  property bool statusV2Layout: false
+  property real widestActiveBarStatus: 0
+
+  Control.PluginUpdateTestService { id: pluginUpdateService }
 
   function fail(message) {
     console.error("control-center-smoke:", message)
@@ -60,12 +66,18 @@ ShellRoot {
     property int splitWrites: 0
     property int resetWrites: 0
     property int restoreWrites: 0
+    property int restoreCancelWrites: 0
     property string restoredWidgetId: ""
     property string restoredPage: ""
     property bool restoreNeedsReplacement: false
+    property string pendingWidgetRestoreId: ""
+    property var pendingWidgetRestoreOwner: null
+    property string pendingWidgetRestoreScreenName: ""
     property bool lastSplitValue: false
     property var clickTargets: root.clickTargets
     property var visualTokens: ({
+      shellStyle: "shibumi",
+      v2Shell: false,
       pillHeight: 24,
       pillRadius: 12,
       pill: "#332f2f",
@@ -76,7 +88,22 @@ ShellRoot {
       panelBackground: "#202020",
       panelBorder: "#404040",
       panelBorderWidth: 1,
-      panelRadius: 12
+      panelRadius: 12,
+      widgetHasFill: function(settings) {
+        return settings && settings.color === "color05"
+      },
+      widgetFillColor: function(settings) {
+        return settings && settings.color === "color05"
+          ? "#cc8844" : "transparent"
+      },
+      widgetSurfaceOpacity: function(settings) {
+        return settings && settings.surfaceOpacity !== undefined
+          ? Number(settings.surfaceOpacity) : 1
+      },
+      widgetContentColor: function(settings, fallback) {
+        return settings && settings.color === "color05"
+          && settings.tone === "background" ? "#111111" : fallback
+      }
     })
 
     function registerClickTarget(target) {
@@ -97,11 +124,56 @@ ShellRoot {
     function switchPanelFrom(_owner, _direction) { return false }
     function targetBelongsToWindow(_target, _window) { return true }
 
-    function scheduleWidgetRestore(pluginId, page, needsReplacement) {
+    function scheduleOpenControlCenterRestores(page, needsReplacement,
+        owner, screenName) {
+      const existing = widgetRestorePendingForOutput(
+        "hancore.shibumi.control-center", owner, screenName)
+      if (!existing) scheduleWidgetRestore(
+        "hancore.shibumi.control-center", page, needsReplacement,
+        owner, screenName)
+      return existing ? [] : [{
+        id: "hancore.shibumi.control-center",
+        owner: owner,
+        screenName: String(screenName || "")
+      }]
+    }
+
+    function cancelCreatedWidgetRestores(records) {
+      const values = Array.isArray(records) ? records : []
+      for (let index = 0; index < values.length; index++) {
+        const record = values[index]
+        cancelWidgetRestore(record.id, record.owner, record.screenName)
+      }
+      return values.length > 0
+    }
+
+    function widgetRestorePendingForOutput(pluginId, owner, screenName) {
+      void(owner)
+      return pendingWidgetRestoreId === String(pluginId || "")
+        && pendingWidgetRestoreScreenName === String(screenName || "")
+    }
+
+    function widgetRestorePendingForOwner(pluginId, owner, screenName) {
+      return widgetRestorePendingForOutput(pluginId, owner, screenName)
+        && pendingWidgetRestoreOwner === owner
+    }
+
+    function scheduleWidgetRestore(pluginId, page, needsReplacement,
+        owner, screenName) {
       restoredWidgetId = String(pluginId || "")
       restoredPage = String(page || "")
       restoreNeedsReplacement = needsReplacement === true
+      void(owner)
+      void(screenName)
       restoreWrites++
+      return true
+    }
+
+    function cancelWidgetRestore(pluginId, owner, screenName) {
+      void(owner)
+      void(screenName)
+      if (String(pluginId || "") !== restoredWidgetId) return false
+      restoreCancelWrites++
       return true
     }
 
@@ -126,6 +198,48 @@ ShellRoot {
     }
   }
 
+  QtObject {
+    id: tileController
+
+    property real controlRadius: 4
+    property color controlHoverFillColor: "#222222"
+    property color controlFillColor: "#111111"
+    property real controlBorderWidth: 1
+    property color controlBorderColor: "#444444"
+    property string marketFont: "sans"
+    property color marketBackground: "#000000"
+
+    function accentColor(name) {
+      return String(name || "") === "color03" ? "#336699" : "#ffffff"
+    }
+  }
+
+  QtObject {
+    id: fakeStatusState
+    function paletteColor(name) {
+      return name === "color03" ? "#33aa55" : "#ffffff"
+    }
+  }
+
+  Control.ActiveBarStatus {
+    id: activeBarStatusProbe
+    visible: false
+    stockOmarchyHost: root.statusStockHost
+    v2LayoutActive: root.statusV2Layout
+    stateService: fakeStatusState
+    neutralColor: "#aabbcc"
+    fontFamily: "monospace"
+  }
+
+  Control.WidgetModuleTile {
+    id: favoriteTileProbe
+    visible: false
+    controller: tileController
+    glyph: "extension"
+    label: "Favorite probe"
+    favorite: true
+  }
+
   State.Service {
     id: stateService
     shell: fakeShell
@@ -138,6 +252,7 @@ ShellRoot {
       Control.BarWidget {
         bar: fakeBar
         panelSource: Qt.resolvedUrl("fixtures/ControlCenterTestPanel.qml")
+        pluginUpdateServiceOverride: pluginUpdateService
       }
     }
   }
@@ -152,6 +267,39 @@ ShellRoot {
 
       if (root.phase === 0) {
         if (!stateService.ready || !widget || root.ticks < 3) return
+        root.widestActiveBarStatus = Math.max(root.widestActiveBarStatus,
+          activeBarStatusProbe.implicitWidth)
+        if (root.activeBarStatusStep === 0) {
+          if (activeBarStatusProbe.statusText !== "SHIBUMI V1 ACTIVE"
+              || activeBarStatusProbe.Accessible.role !== Accessible.StaticText
+              || activeBarStatusProbe.Accessible.name !== "SHIBUMI V1 ACTIVE"
+              || String(activeBarStatusProbe.renderedDotColor) !== "#33aa55"
+              || String(activeBarStatusProbe.renderedLabelColor) !== "#aabbcc")
+            return root.fail("V1 active-bar header status")
+          root.statusV2Layout = true
+          root.activeBarStatusStep = 1
+          return
+        }
+        if (root.activeBarStatusStep === 1) {
+          if (activeBarStatusProbe.statusText !== "SHIBUMI V2 ACTIVE"
+              || activeBarStatusProbe.Accessible.name !== "SHIBUMI V2 ACTIVE")
+            return root.fail("V2 active-bar header status")
+          root.statusStockHost = true
+          root.activeBarStatusStep = 2
+          return
+        }
+        if (root.activeBarStatusStep === 2) {
+          if (activeBarStatusProbe.statusText !== "OMARCHY BAR ACTIVE"
+              || activeBarStatusProbe.Accessible.name !== "OMARCHY BAR ACTIVE"
+              || activeBarStatusProbe.implicitWidth <= 0
+              || root.widestActiveBarStatus >= 240)
+            return root.fail("Omarchy active-bar header status geometry")
+          root.activeBarStatusStep = 3
+        }
+        if (String(favoriteTileProbe.favoriteStatusColor) !== "#336699"
+            || String(favoriteTileProbe.favoriteGlyphColor) !== "#336699"
+            || favoriteTileProbe.favoriteGlyphText !== "󰓎")
+          return root.fail("favorite star does not use the color03 Nerd Font glyph")
         if (widget.moduleName !== "hancore.shibumi.control-center"
             || widget.panelLoaded || widget.iconMode
             || !widget.shibumiWordmark
@@ -201,6 +349,14 @@ ShellRoot {
             || !panel.setMediaPickerStyle("hearthstone")
             || !panel.setReactorMode(8))
           return root.fail("state mutation facade rejected valid values")
+        const layoutRestoreWrites = fakeBar.restoreWrites
+        if (!panel.setLayoutProtection("v1", true)
+            || fakeBar.restoreWrites !== layoutRestoreWrites + 1
+            || fakeBar.restoredPage !== "quick"
+            || fakeBar.restoreNeedsReplacement
+            || panel.setLayoutProtection("v3", true)
+            || fakeBar.restoreCancelWrites !== 0)
+          return root.fail("layout protection restore contract failed")
 
         if (stateService.groupAppearanceSettingForVariant(
               "G4", "v1", "compact", false) !== true
@@ -214,8 +370,22 @@ ShellRoot {
             || stateService.config.picker.mediaStyle !== "hearthstone"
             || stateService.config.picker.style !== "hearthstone"
             || stateService.config.reactor.mode !== 8
-            || fakeShell.writes !== 7)
+            || panel.v1LayoutProtected !== true
+            || panel.v2LayoutProtected !== false
+            || fakeShell.writes !== 8)
           return root.fail("state mutations did not persist")
+
+        fakeBar.pendingWidgetRestoreId = ""
+        fakeBar.pendingWidgetRestoreOwner = null
+        fakeBar.pendingWidgetRestoreScreenName = ""
+        const unchangedProtectionRestoreWrites = fakeBar.restoreWrites
+        const unchangedProtectionCancelWrites = fakeBar.restoreCancelWrites
+        if (panel.setLayoutProtection("v1", true)
+            || fakeBar.restoreWrites
+              !== unchangedProtectionRestoreWrites + 1
+            || fakeBar.restoreCancelWrites
+              !== unchangedProtectionCancelWrites + 1)
+          return root.fail("unchanged layout protection left a pending restore")
 
         if (!panel.setBarPosition("bottom")
             || !panel.setAllSplits(true)
@@ -237,12 +407,12 @@ ShellRoot {
             + " owner=" + widget.opened
             + " type=" + typeof fakeBar.scheduleWidgetRestore)
         if (!panel.setBarPresentation("shellStyle", "full")
-            || fakeBar.restoreWrites !== 3
+            || fakeBar.restoreWrites !== 5
             || fakeBar.restoredWidgetId !== "hancore.shibumi.control-center"
             || fakeBar.restoredPage !== "functions"
             || !fakeBar.restoreNeedsReplacement
             || stateService.config.presentation.shellStyle !== "full"
-            || fakeShell.writes !== 10)
+            || fakeShell.writes !== 11)
           return root.fail("bar presentation changes did not preserve the open page"
             + " restore=" + fakeBar.restoreWrites
             + " id=" + fakeBar.restoredWidgetId
@@ -276,9 +446,114 @@ ShellRoot {
               - v1OverviewPanelHeight) > 0.5)
           return root.fail("Icons overview height differed between V1 and V2")
         panel.v2LayoutActive = false
+        if (!appearance.resetActionVisible
+            || appearance.resetConfirmationPending
+            || appearance.activeResetVariant !== "v1"
+            || appearance.resetActionLabel !== "RESET V1 DEFAULTS"
+            || !Qt.colorEqual(appearance.resetActionColor,
+              panel.accentColor("color03"))
+            || !appearance.controller.setGroupSetting(
+              "G4", "color", "color05")
+            || !appearance.controller.setGroupSetting(
+              "G9", "mediaStyle", "full")
+            || !stateService.setGroupAppearanceSettingForVariant(
+              "G:hancore.shibumi.storage", "v1", "displayMode", "icon")
+            || !stateService.setGroupAppearanceSettingForVariant(
+              "G2", "v2", "color", "color05"))
+          return root.fail("V1 global reset fixture was rejected")
+        const launcherBeforeV1Reset = JSON.stringify(
+          stateService.config.launcher)
+        if (!appearance.requestAppearanceReset()
+            || !appearance.resetConfirmationPending
+            || appearance.resetActionLabel !== "CONFIRM V1 RESET"
+            || !Qt.colorEqual(appearance.resetActionColor,
+              panel.accentColor("color01"))
+            || stateService.groupAppearanceSettingForVariant(
+              "G4", "v1", "color", "") !== "color05")
+          return root.fail("V1 global reset did not require confirmation")
+        appearance.motionActive = false
+        if (appearance.resetActionVisible
+            || appearance.resetConfirmationPending
+            || stateService.groupAppearanceSettingForVariant(
+              "G4", "v1", "color", "") !== "color05")
+          return root.fail("hidden V1 global reset remained armed")
+        appearance.motionActive = true
+        if (!appearance.resetActionVisible
+            || !Qt.colorEqual(appearance.resetActionColor,
+              panel.accentColor("color03"))
+            || !appearance.requestAppearanceReset()
+            || !appearance.resetConfirmationPending
+            || !Qt.colorEqual(appearance.resetActionColor,
+              panel.accentColor("color01")))
+          return root.fail("V1 global reset could not be re-armed")
+        if (!appearance.requestAppearanceReset()
+            || appearance.resetConfirmationPending
+            || appearance.resetActionLabel !== "RESET V1 DEFAULTS"
+            || !Qt.colorEqual(appearance.resetActionColor,
+              panel.accentColor("color03"))
+            || stateService.groupAppearanceSettingForVariant(
+              "G4", "v1", "color", "") !== "inherit"
+            || stateService.groupAppearanceSettingForVariant(
+              "G9", "v1", "mediaStyle", "") !== "default"
+            || stateService.groupAppearanceSettingForVariant(
+              "G:hancore.shibumi.storage", "v1", "displayMode", "")
+                !== "full"
+            || stateService.groupAppearanceSettingForVariant(
+              "G2", "v2", "color", "") !== "color05"
+            || JSON.stringify(stateService.config.launcher)
+              !== launcherBeforeV1Reset)
+          return root.fail("V1 global reset did not restore isolated defaults")
+        if (!stateService.resetGroupAppearanceForVariant("G2", "v2"))
+          return root.fail("V1 global reset fixture cleanup failed")
+
+        panel.v2LayoutActive = true
+        if (!appearance.resetActionVisible
+            || appearance.resetConfirmationPending
+            || appearance.activeResetVariant !== "v2"
+            || appearance.resetActionLabel !== "RESET V2 DEFAULTS"
+            || !Qt.colorEqual(appearance.resetActionColor,
+              panel.accentColor("color03"))
+            || !appearance.controller.setGroupSetting(
+              "G4", "displayMode", "text")
+            || !appearance.controller.setGroupSetting(
+              "G9", "mediaStyle", "full")
+            || !appearance.controller.setGroupSetting(
+              "G18", "widgetRadius", "round")
+            || !stateService.setGroupAppearanceSettingForVariant(
+              "G2", "v1", "color", "color04"))
+          return root.fail("V2 global reset fixture was rejected")
+        const launcherBeforeV2Reset = JSON.stringify(
+          stateService.config.launcher)
+        if (!appearance.requestAppearanceReset()
+            || !appearance.resetConfirmationPending
+            || appearance.resetActionLabel !== "CONFIRM V2 RESET"
+            || !Qt.colorEqual(appearance.resetActionColor,
+              panel.accentColor("color01")))
+          return root.fail("V2 global reset did not require confirmation")
+        if (!appearance.requestAppearanceReset()
+            || appearance.resetConfirmationPending
+            || appearance.resetActionLabel !== "RESET V2 DEFAULTS"
+            || !Qt.colorEqual(appearance.resetActionColor,
+              panel.accentColor("color03"))
+            || stateService.groupAppearanceSettingForVariant(
+              "G4", "v2", "displayMode", "") !== "full"
+            || stateService.groupAppearanceSettingForVariant(
+              "G9", "v2", "mediaStyle", "") !== "default"
+            || stateService.groupAppearanceSettingForVariant(
+              "G18", "v2", "widgetRadius", "") !== "auto"
+            || stateService.groupAppearanceSettingForVariant(
+              "G2", "v1", "color", "") !== "color04"
+            || JSON.stringify(stateService.config.launcher)
+              !== launcherBeforeV2Reset)
+          return root.fail("V2 global reset did not restore isolated defaults")
+        if (!stateService.resetGroupAppearanceForVariant("G2", "v1"))
+          return root.fail("V2 global reset fixture cleanup failed")
+
+        panel.v2LayoutActive = false
         if (appearance.widgetDetailOpen
             || !appearance.openWidgetDetails("G1", "")
-            || !appearance.widgetDetailOpen)
+            || !appearance.widgetDetailOpen
+            || appearance.resetActionVisible)
           return root.fail("Icons did not open Launcher details")
         const v1SelectionPanelHeight = panel.compactIconsSelectionPanelHeight
         panel.v2LayoutActive = true
@@ -288,6 +563,27 @@ ShellRoot {
           return root.fail(
             "Icons selection height differed between V1 and V2")
         panel.v2LayoutActive = false
+        if (!panel.setLauncherSelection("icon", "shibumi"))
+          return root.fail("V1 Launcher tint fixture was rejected")
+        if (!appearance.controller.setGroupSetting("G1", "color", "color05")
+            || !appearance.controller.setGroupSetting(
+              "G1", "tone", "background")
+            || !appearance.controller.setGroupSetting(
+              "G1", "surfaceOpacity", 0.4))
+          return root.fail("V1 Launcher appearance settings were rejected")
+        widget.settings = stateService.groupSettingsForVariant("G1", "v1")
+        if (!widget.nativePillSurfaceVisible
+            || !widget.v1CustomFill
+            || !widget.v1TintedLauncherIconVisible
+            || Math.abs(widget.renderedPillFillColor.a - 0.4) > 0.001
+            || stateService.groupAppearanceSettingForVariant(
+              "G1", "v2", "color", "inherit") !== "inherit")
+          return root.fail("V1 Launcher appearance was not isolated")
+        if (!appearance.controller.resetGroupAppearance("G1"))
+          return root.fail("V1 Launcher appearance reset was rejected")
+        widget.settings = stateService.groupSettingsForVariant("G1", "v1")
+        if (widget.v1CustomFill || widget.v1TintedLauncherIconVisible)
+          return root.fail("V1 Launcher appearance reset drifted")
         appearance.controller.setGroupSetting("G1", "displayMode", "text")
         if (!widget.iconMode)
           return root.fail("V1 generic presentation overrode launcher icon")
@@ -330,6 +626,65 @@ ShellRoot {
               "G4", "v2", "displayMode", "") !== "full")
           return root.fail("V1 mode change leaked into V2")
         appearance.showWidgetOverview()
+        if (!appearance.openWidgetDetails("G5", "")
+            || !appearance.selectedV1Appearance
+            || appearance.selectedV1CpuCompact
+            || appearance.selectedWidgetModeOptions.length !== 2
+            || appearance.selectedWidgetModeOptions[0].value !== "full"
+            || appearance.selectedWidgetModeOptions[0].label !== "Default"
+            || appearance.selectedWidgetModeOptions[1].value !== "icon"
+            || appearance.selectedWidgetModeOptions[1].label !== "Compact")
+          return root.fail("CPU V1 did not expose Default/Compact controls")
+        if (!appearance.cycleSelectedWidgetMode()
+            || appearance.selectedWidgetMode !== "icon"
+            || !appearance.selectedV1CpuCompact
+            || !appearance.cycleSelectedWidgetMode()
+            || appearance.selectedWidgetMode !== "full"
+            || appearance.selectedV1CpuCompact)
+          return root.fail("CPU preview did not separate Default and Compact")
+        const v1AppearanceGroups = [
+          "G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9",
+          "G10", "G11", "G12", "G13", "G14", "G15", "G16", "G17", "G18"
+        ]
+        for (let index = 0; index < v1AppearanceGroups.length; index++) {
+          if (!appearance.openWidgetDetails(v1AppearanceGroups[index], "")
+              || !appearance.selectedV1Appearance)
+            return root.fail("V1 appearance rollout missed "
+              + v1AppearanceGroups[index])
+        }
+        if (!appearance.openWidgetDetails("G5", "")
+            || !appearance.controller.setGroupSetting(
+              "G5", "color", "color05")
+            || !appearance.controller.setGroupSetting(
+              "G5", "tone", "background")
+            || !appearance.controller.setGroupSetting(
+              "G5", "surfaceOpacity", 0.6)
+            || stateService.groupAppearanceSettingForVariant(
+              "G5", "v1", "color", "") !== "color05"
+            || stateService.groupAppearanceSettingForVariant(
+              "G5", "v1", "tone", "") !== "background"
+            || stateService.groupAppearanceSettingForVariant(
+              "G5", "v1", "surfaceOpacity", 0) !== 0.6
+            || stateService.groupAppearanceSettingForVariant(
+              "G5", "v2", "color", "inherit") !== "inherit"
+            || stateService.groupAppearanceSettingForVariant(
+              "G5", "v2", "tone", "auto") !== "auto"
+            || stateService.groupAppearanceSettingForVariant(
+              "G5", "v2", "surfaceOpacity", 1) !== 1
+            || appearance.selectedWidgetTone !== "background"
+            || appearance.selectedWidgetOpacity !== 0.6
+            || !appearance.widgetUsesCustomAppearance("G5"))
+          return root.fail("CPU V1 fill/tone/opacity did not persist")
+        if (!appearance.controller.resetGroupAppearance("G5")
+            || stateService.groupAppearanceSettingForVariant(
+              "G5", "v1", "color", "") !== "inherit"
+            || stateService.groupAppearanceSettingForVariant(
+              "G5", "v1", "tone", "") !== "auto"
+            || stateService.groupAppearanceSettingForVariant(
+              "G5", "v1", "surfaceOpacity", 0) !== 1
+            || appearance.widgetUsesCustomAppearance("G5"))
+          return root.fail("CPU V1 appearance reset did not restore defaults")
+        appearance.showWidgetOverview()
         if (!appearance.openWidgetDetails("G9", "")
             || appearance.selectedWidgetMode !== "default"
             || !appearance.cycleSelectedWidgetMode()
@@ -340,6 +695,29 @@ ShellRoot {
         if (!appearance.cycleSelectedWidgetMode()
             || appearance.selectedWidgetMode !== "default")
           return root.fail("V1 Now Playing style did not restore")
+        if (!appearance.controller.setGroupSetting("G9", "color", "color05")
+            || !appearance.controller.setGroupSetting(
+              "G9", "tone", "foreground")
+            || !appearance.controller.setGroupSetting(
+              "G9", "surfaceOpacity", 0.4)
+            || appearance.selectedWidgetMode !== "default"
+            || stateService.groupAppearanceSettingForVariant(
+              "G9", "v1", "mediaStyle", "") !== "default"
+            || stateService.groupAppearanceSettingForVariant(
+              "G9", "v1", "color", "") !== "color05"
+            || stateService.groupAppearanceSettingForVariant(
+              "G9", "v1", "tone", "") !== "foreground"
+            || stateService.groupAppearanceSettingForVariant(
+              "G9", "v1", "surfaceOpacity", 0) !== 0.4
+            || stateService.groupAppearanceSettingForVariant(
+              "G9", "v2", "color", "inherit") !== "inherit"
+            || !appearance.widgetUsesCustomAppearance("G9"))
+          return root.fail(
+            "V1 Now Playing appearance changed its existing style contract")
+        if (!appearance.controller.resetGroupAppearance("G9")
+            || appearance.selectedWidgetMode !== "default"
+            || appearance.widgetUsesCustomAppearance("G9"))
+          return root.fail("V1 Now Playing appearance reset drifted")
         panel.v2LayoutActive = true
         if (!appearance.openWidgetDetails("G9", "")
             || appearance.selectedWidgetMode !== "default"
@@ -476,16 +854,27 @@ ShellRoot {
         appearance.showWidgetOverview()
         if (!appearance.openWidgetDetails(
               "G18", "hancore.shibumi.storage")
-            || appearance.selectedWidgetActive)
-          return root.fail("V1 Icons did not expose inactive Storage")
+            || appearance.selectedWidgetActive
+            || !appearance.selectedV1Appearance)
+          return root.fail("V1 Icons did not expose inactive Storage appearance")
         const inactiveModeBeforeCycle = appearance.selectedWidgetMode
-        const expectedInactiveModeAfterCycle = "full"
-        if (!appearance.cycleSelectedWidgetMode()
+        const expectedInactiveModeAfterCycle = inactiveModeBeforeCycle === "full"
+          ? "icon" : "full"
+        if (appearance.selectedWidgetModeOptions.length !== 2
+            || appearance.selectedWidgetModeOptions[0].label !== "Default"
+            || appearance.selectedWidgetModeOptions[1].label !== "Compact"
+            || !appearance.cycleSelectedWidgetMode()
             || appearance.selectedWidgetMode !== expectedInactiveModeAfterCycle
             || stateService.groupAppearanceSettingForVariant(
               "G:hancore.shibumi.storage", "v1", "displayMode", "")
                 !== expectedInactiveModeAfterCycle)
-          return root.fail("V1 exposed Compact for an unsupported widget")
+          return root.fail("V1 Storage did not expose Default/Compact"
+            + " before=" + inactiveModeBeforeCycle
+            + " after=" + appearance.selectedWidgetMode
+            + " expected=" + expectedInactiveModeAfterCycle
+            + " options=" + JSON.stringify(appearance.selectedWidgetModeOptions)
+            + " stored=" + stateService.groupAppearanceSettingForVariant(
+              "G:hancore.shibumi.storage", "v1", "displayMode", ""))
         panel.v2LayoutActive = true
         if (appearance.activeWidgetCount !== 15
             || appearance.inactiveWidgetCount !== 3
@@ -533,19 +922,80 @@ ShellRoot {
             || plugins.omarchyProviderCount !== 1
             || plugins.thirdPartyProviderCount !== 1)
           return root.fail("plugin provider summary is ambiguous")
+        if (pluginUpdateService.checkCount !== 1
+            || pluginUpdateService.consumerCount !== 1
+            || !pluginUpdateService.checked
+            || panel.pluginUpdateCount !== 2
+            || pluginUpdateService.checkedCount !== 3
+            || panel.pluginUpdateShortStatusText !== "2 available"
+            || panel.pluginUpdateStatusText !== "2 updates available")
+          return root.fail("plugin update text did not expose the scan state: checks="
+            + pluginUpdateService.checkCount + " consumers="
+            + pluginUpdateService.consumerCount + " checked="
+            + pluginUpdateService.checked + " updates=" + panel.pluginUpdateCount
+            + " checkedCount=" + pluginUpdateService.checkedCount
+            + " motion=" + plugins.motionActive
+            + " favorites=" + plugins.favoritesOnly
+            + " consumerActive=" + plugins.pluginUpdateConsumerActive
+            + " effective=" + (panel.effectivePluginUpdateService !== null)
+            + " shortStatus=" + panel.pluginUpdateShortStatusText
+            + " status=" + panel.pluginUpdateStatusText)
+        plugins.feedbackProgress = 2
+        if (plugins.boundedFeedbackProgress !== 1
+            || Math.abs(plugins.feedbackProgressRenderedWidth
+              - plugins.feedbackProgressAvailableWidth) > 0.01)
+          return root.fail("plugin feedback progress upper clamp")
+        plugins.feedbackProgress = -1
+        if (plugins.boundedFeedbackProgress !== 0
+            || plugins.feedbackProgressRenderedWidth !== 0)
+          return root.fail("plugin feedback progress lower clamp")
+        plugins.feedbackProgress = 0
         if (!plugins.togglePluginById("omarchy.audio")
             || !plugins.feedbackVisible
             || !plugins.feedbackCountdownRunning
             || plugins.feedbackProgress <= 0
+            || plugins.feedbackProgressInset < panel.controlRadius
+            || plugins.feedbackProgressAvailableWidth <= 0
+            || Math.abs(plugins.feedbackProgressAvailableWidth
+              - Math.max(0, plugins.width
+                - 2 * plugins.feedbackProgressInset)) > 0.01
+            || plugins.feedbackProgressRenderedWidth <= 0
+            || plugins.feedbackProgressRenderedWidth
+              > plugins.feedbackProgressAvailableWidth + 0.01
+            || plugins.feedbackProgressInset
+              + plugins.feedbackProgressRenderedWidth
+              > plugins.width - plugins.feedbackProgressInset + 0.01
             || plugins.feedbackTitle !== "Omarchy Audio activated"
             || plugins.feedbackDetail.indexOf("hidden") < 0
+            || !plugins.undoGroupStates.G6
+            || plugins.undoGroupStates.G6.v1 !== true
+            || plugins.undoGroupStates.G6.v2 !== false
+            || !plugins.undoProviderSnapshot
+            || plugins.undoProviderSnapshot.token
+              !== "audio-provider-snapshot"
             || panel.pluginEntries[0].installedInBar
             || !panel.pluginEntries[0].replaced
             || !panel.pluginEntries[1].installedInBar
             || !panel.pluginEntries[1].replacementInEffect)
           return root.fail(
             "provider switch did not expose replacement feedback")
+        const providerRestoreWrites = fakeBar.restoreWrites
+        const providerRestoreCancelWrites = fakeBar.restoreCancelWrites
+        panel.rejectProviderRestore = true
+        if (plugins.undoLastChange()
+            || fakeBar.restoreWrites !== providerRestoreWrites + 1
+            || fakeBar.restoreCancelWrites
+              !== providerRestoreCancelWrites + 1
+            || !plugins.feedbackVisible
+            || !plugins.feedbackCountdownRunning
+            || plugins.feedbackProgress <= 0
+            || !plugins.undoGroupStates.G6)
+          return root.fail("failed provider restore discarded Undo")
+        panel.rejectProviderRestore = false
         if (!plugins.undoLastChange()
+            || fakeBar.restoreWrites !== providerRestoreWrites + 2
+            || fakeBar.restoreCancelWrites
+              !== providerRestoreCancelWrites + 1
             || plugins.feedbackVisible
             || plugins.feedbackCountdownRunning
             || plugins.feedbackProgress !== 0
@@ -661,7 +1111,16 @@ ShellRoot {
               || panel.settingsPageItem.surfaceEffectPreviewCount !== 0
               || panel.settingsPageItem.splitActionPreviewCount !== 0
               || panel.settingsPageItem.surfaceRadiusOptionCount !== 0
-              || panel.settingsPageItem.childRouteAvailable)
+              || panel.settingsPageItem.layoutActionCount !== 3
+              || panel.settingsPageItem.layoutActionControlWidth < 88
+              || !panel.settingsPageItem.layoutActionLabelsFit
+              || !panel.compactBarsPage
+              || panel.compactBarsPanelHeight > 656
+              || Math.abs(panel.compactBarsPanelHeight
+                - (panel.configureDetailPanelChromeHeight
+                  + panel.settingsPageItem.implicitHeight)) > 0.5
+              || panel.settingsPageItem.childRouteAvailable
+              || panel.settingsPageItem.activeLayoutProtected)
             return root.fail("V2 exposed V1 Bar Surface settings"
               + " effects=" + (panel && panel.settingsPageItem
                 ? panel.settingsPageItem.surfaceEffectOptionCount : "missing")
@@ -671,12 +1130,41 @@ ShellRoot {
               + " page-v2=" + (panel && panel.settingsPageItem
                 ? panel.settingsPageItem.v2Active : "missing")
               + " shell=" + (panel ? panel.activeShell : "missing"))
+          // Reproduce a lock click while the variant-switch restore still
+          // owns the handoff. The lock mutation must neither restart nor
+          // downgrade that stronger replacement-owner restore.
+          fakeBar.pendingWidgetRestoreId =
+            "hancore.shibumi.control-center"
+          // The restored replacement owner differs from the outgoing owner;
+          // output identity, not owner identity, must preserve the handoff.
+          fakeBar.pendingWidgetRestoreOwner = null
+          fakeBar.pendingWidgetRestoreScreenName = ""
+          fakeBar.restoreNeedsReplacement = true
+          const v2LayoutRestoreWrites = fakeBar.restoreWrites
+          if (!panel.settingsPageItem.toggleActiveLayoutProtection()
+              || stateService.config.layoutProtection.v2 !== true
+              || !panel.settingsPageItem.activeLayoutProtected
+              || fakeBar.restoreWrites !== v2LayoutRestoreWrites
+              || !fakeBar.restoreNeedsReplacement)
+            return root.fail("V2 layout protection disturbed variant handoff")
+          fakeBar.pendingWidgetRestoreId = ""
+          fakeBar.pendingWidgetRestoreOwner = null
+          fakeBar.pendingWidgetRestoreScreenName = ""
           panel.v2LayoutActive = false
           if (panel.settingsPageItem.surfaceEffectOptionCount !== 3
               || panel.settingsPageItem.surfaceEffectPreviewCount !== 3
               || panel.settingsPageItem.splitActionPreviewCount !== 2
               || panel.settingsPageItem.surfaceRadiusOptionCount !== 2
+              || panel.settingsPageItem.layoutActionCount !== 3
+              || panel.settingsPageItem.layoutActionControlWidth < 88
+              || !panel.settingsPageItem.layoutActionLabelsFit
+              || !panel.compactBarsPage
+              || panel.compactBarsPanelHeight > 656
+              || Math.abs(panel.compactBarsPanelHeight
+                - (panel.configureDetailPanelChromeHeight
+                  + panel.settingsPageItem.implicitHeight)) > 0.5
               || !panel.settingsPageItem.childRouteAvailable
+              || !panel.settingsPageItem.activeLayoutProtected
               || panel.settingsPageItem.childRouteLabel !== "Gap Animations"
               || !panel.showSettingsPage("bars-motion"))
             return root.fail("V1 Gap Animations child route was unavailable")
@@ -702,7 +1190,15 @@ ShellRoot {
             || panel.settingsPageItem.surfaceEffectOptionCount !== 3
             || panel.settingsPageItem.surfaceEffectPreviewCount !== 3
             || panel.settingsPageItem.splitActionPreviewCount !== 2
-            || panel.settingsPageItem.surfaceRadiusOptionCount !== 2)
+            || panel.settingsPageItem.surfaceRadiusOptionCount !== 2
+            || panel.settingsPageItem.layoutActionCount !== 3
+            || panel.settingsPageItem.layoutActionControlWidth < 88
+            || !panel.settingsPageItem.layoutActionLabelsFit
+            || !panel.compactBarsPage
+            || panel.compactBarsPanelHeight > 656
+            || Math.abs(panel.compactBarsPanelHeight
+              - (panel.configureDetailPanelChromeHeight
+                + panel.settingsPageItem.implicitHeight)) > 0.5)
           return root.fail("Bars return navigation did not restore V1")
         panel.healthService.report = {
           schemaVersion: 1,
@@ -922,9 +1418,44 @@ ShellRoot {
             || panel.lastQuickSystemAction !== "screensaver")
           return root.fail("Quick action deck did not delegate to its owners")
         if (!quick.activateAction("add-plugin")
-            || !panel.pluginInstallerOpen || !panel.handleEscape()
-            || panel.pluginInstallerOpen || !panel.open || !widget.opened)
-          return root.fail("direct plugin installer or staged Escape failed")
+            || !panel.pluginInstallerOpen)
+          return root.fail("direct plugin installer did not open")
+        const pluginRepository =
+          "https://github.com/robzolkos/omarchy-github.git"
+        const pluginCommand = "omarchy plugin add " + pluginRepository
+          + " --enable"
+        if (panel.extractPluginInstallUrl(pluginRepository)
+              !== pluginRepository
+            || panel.extractPluginInstallUrl(pluginCommand)
+              !== pluginRepository
+            || panel.extractPluginInstallUrl(
+              "$ omarchy plugin add 'git@github.com:owner/plugin.git' --enable")
+              !== "git@github.com:owner/plugin.git"
+            || panel.extractPluginInstallUrl(
+              "omarchy plugin add \"ssh://git@github.com/owner/plugin.git\"")
+              !== "ssh://git@github.com/owner/plugin.git"
+            || panel.extractPluginInstallUrl(pluginRepository + " "
+              + "https://github.com/other/plugin.git") !== ""
+            || panel.extractPluginInstallUrl(
+              "omarchy plugin add '" + pluginRepository) !== "")
+          return root.fail("plugin installer command extraction")
+        const normalizedInstallCommand =
+          panel.pluginInstallCommandFor(pluginCommand)
+        if (JSON.stringify(normalizedInstallCommand) !== JSON.stringify([
+              "omarchy", "plugin", "add", pluginRepository, "--yes"
+            ]))
+          return root.fail("plugin installer argv normalization")
+        if (panel.setPluginInstallInput(pluginCommand) !== pluginRepository
+            || !panel.validPluginInstallUrl
+            || !panel.pluginInstallInputWasCommand
+            || panel.normalizedPluginInstallUrl !== pluginRepository
+            || !panel.normalizePluginInstallInput()
+            || panel.pluginInstallUrl !== pluginRepository
+            || panel.pluginInstallInputWasCommand)
+          return root.fail("plugin installer input normalization")
+        if (!panel.handleEscape() || panel.pluginInstallerOpen
+            || !panel.open || !widget.opened)
+          return root.fail("direct plugin installer staged Escape failed")
         if (!quick.activateAction("bars") || panel.settingsPage !== "bars"
             || !panel.showSettingsPage("quick"))
           return root.fail("Quick Bars tile did not open its existing editor")

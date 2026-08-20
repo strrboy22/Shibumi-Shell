@@ -25,8 +25,10 @@ and normalizes this branch before using it. It includes:
 - workspace mode and presentation;
 - G1 launcher identity;
 - image and media picker styles;
+- the selected thermal sensor and its persisted Celsius or Fahrenheit display;
 - V1 Reactor mode, selected through **Bars → Gap Animations** from nine direct
-  preview tiles.
+  preview tiles;
+- independent V1 and V2 layout-protection preferences.
 
 Use the Control Center for normal changes. Manual JSON edits can be rejected or
 normalized when they violate the schema.
@@ -66,6 +68,20 @@ up to two additional slots on each outer side. The center cannot be extended.
   split array in the same validated state transaction.
 - **Restore layout** returns V1 to its fixed `7 / 1 / 7` default and removes
   every extra position.
+
+### Layout protection
+
+The Bars page places the **Lock V1 layout** or **Lock V2 layout** toggle
+between the active profile's Edit and Restore buttons. The three controls stay
+side by side, while the toggle track makes the lock state directly visible.
+The preferences are independent and default to off, preserving direct live
+editing for existing users.
+
+When protection is on, direct split, divider, and section-boundary clicks on
+the bar are ignored outside **Edit slots** or **Edit layout**. Entering the
+matching edit mode temporarily permits those changes; leaving it with Escape
+or an outside click protects the layout again. Deliberate Control Center
+actions such as Split all, Merge all, and Restore layout remain available.
 
 Existing fixed-layout configurations migrate without changing group order or
 split values. Order, slot roles, and split arrays are accepted as one unit; an
@@ -121,6 +137,12 @@ layout snapshots through the suite's continuity manager.
 - `omarchy bar reset` selects the stock host without a full defaults reset.
 - `omarchy bar defaults` replaces the complete `bar` object, including
   `bar.shibumi`.
+
+`bar.transparent` belongs to the stock `omarchy.bar`. Shibumi V1 and V2 remain
+opaque regardless of that value and provide no transparency control. Suite
+install, update, activation, deactivation, and migration preserve an existing
+preference unchanged, so returning to `omarchy.bar` restores its previous
+transparent or opaque presentation.
 
 ## Plugin installation and suite state
 

@@ -21,11 +21,18 @@ Item {
       ? Number(stateService.revision) || 0 : 0
   readonly property bool v2Shell: !!(bar.visualTokens
     && bar.visualTokens.v2Shell === true)
-  readonly property var groupSettings: stateService
-    && typeof stateService.groupSettingsForVariant === "function"
-    ? stateService.groupSettingsForVariant(groupId,
-        v2Shell ? "v2" : "v1")
-    : stateConfig.widgets ? stateConfig.widgets[groupId] || ({}) : ({})
+  readonly property var groupSettings: {
+    // Calls across the plugin-service boundary do not reliably retain nested
+    // config dependencies. Observe both published invalidation surfaces before
+    // resolving variant-local settings and explicit WidgetSlot overrides.
+    void(stateConfig)
+    void(stateRevision)
+    return stateService
+      && typeof stateService.groupSettingsForVariant === "function"
+      ? stateService.groupSettingsForVariant(groupId,
+          v2Shell ? "v2" : "v1")
+      : stateConfig.widgets ? stateConfig.widgets[groupId] || ({}) : ({})
+  }
   readonly property bool groupEnabled: {
     // Calls across the plugin-service boundary do not reliably retain nested
     // config dependencies. Observe the published config/revision explicitly
@@ -38,8 +45,22 @@ Item {
             groupId, v2Shell ? "v2" : "v1")
         : groupSettings.enabled !== false
   }
-  readonly property bool dynamicV1Group: !v2Shell
-    && GroupRegistry.dynamicModuleIdForGroup(groupId) !== ""
+  readonly property string dynamicModuleId:
+    GroupRegistry.dynamicModuleIdForGroup(groupId)
+  readonly property bool dynamicV1Group: !v2Shell && dynamicModuleId !== ""
+  // These optional suite widgets already own a native PillSurface. Keep the
+  // compatibility wrapper only for external dynamic widgets so inherited and
+  // custom fills both composite exactly once.
+  readonly property bool dynamicV1WidgetOwnsSurface: dynamicV1Group
+    && [
+      "hancore.shibumi.temperature",
+      "hancore.shibumi.gpu",
+      "hancore.shibumi.storage"
+    ].indexOf(dynamicModuleId) >= 0
+  readonly property bool dynamicV1CustomFill: dynamicV1WidgetOwnsSurface
+    && !!(bar.visualTokens
+      && typeof bar.visualTokens.widgetHasFill === "function"
+      && bar.visualTokens.widgetHasFill(groupSettings))
   // Per-group fill, border, radius, and padding belong to V2. V1 preserves
   // the original widget-owned pill recipe independently of these settings.
   readonly property bool appearanceFill: v2Shell && !!(bar.visualTokens
@@ -70,6 +91,8 @@ Item {
     && bar.visualTokens.slotHeight !== undefined
     ? Number(bar.visualTokens.slotHeight) || 28 : 28
   readonly property Item visualSurfaceItem: widgetSurface
+  readonly property bool dynamicShadowLoaded:
+    dynamicShadowLoader.item !== null
   readonly property bool hasContent: implicitWidth > 0.5 && implicitHeight > 0.5
   readonly property real minimumResponsiveWidth: contentItem
     && "minimumResponsiveWidth" in contentItem
@@ -99,7 +122,8 @@ Item {
     width: parent.width
     height: root.v2Shell || root.dynamicV1Group
       ? Math.min(parent.height, root.v2SurfaceHeight) : parent.height
-    visible: root.decorated || root.dynamicV1Group
+    visible: root.decorated
+      || (root.dynamicV1Group && !root.dynamicV1WidgetOwnsSurface)
     radius: root.dynamicV1Group && root.bar.visualTokens
       && root.bar.visualTokens.pillRadius !== undefined
       ? root.bar.visualTokens.pillRadius : root.bar.visualTokens
@@ -131,19 +155,31 @@ Item {
       ? root.bar.visualTokens.widgetBorderColor(root.groupSettings)
       : "transparent"
 
-    RectangularShadow {
+    Loader {
+      id: dynamicShadowLoader
+
       anchors.fill: parent
-      visible: root.dynamicV1Group && root.bar.visualTokens
+      active: root.dynamicV1Group && !root.dynamicV1WidgetOwnsSurface
+        && root.bar.visualTokens
         && root.bar.visualTokens.shadowEnabled === true
-      radius: parent.radius
-      blur: 8
-      spread: 0
-      offset: Qt.vector2d(0,
-        root.bar && root.bar.position === "bottom" ? -1 : 1)
-      color: root.bar.visualTokens
-        && root.bar.visualTokens.pillShadow !== undefined
-        ? root.bar.visualTokens.pillShadow : Qt.rgba(0, 0, 0, 0.55)
+      sourceComponent: active ? dynamicV1Shadow : null
       z: -1
+    }
+
+    Component {
+      id: dynamicV1Shadow
+
+      RectangularShadow {
+        anchors.fill: parent
+        radius: widgetSurface.radius
+        blur: 8
+        spread: 0
+        offset: Qt.vector2d(0,
+          root.bar && root.bar.position === "bottom" ? -1 : 1)
+        color: root.bar.visualTokens
+          && root.bar.visualTokens.pillShadow !== undefined
+          ? root.bar.visualTokens.pillShadow : Qt.rgba(0, 0, 0, 0.55)
+      }
     }
   }
 
@@ -201,6 +237,11 @@ Item {
             required property int index
             bar: root.bar
             entry: root.resolvedEntry(modelData)
+            hostEntry: GroupRegistry.hostEntryFor(
+              modelData, root.bar.layoutConfig)
+            settingsOverrides: GroupRegistry.settingsOverridesFor(
+              root.groupId, modelData, root.groupSettings,
+              root.bar.layoutConfig)
             region: root.groupId
             screenName: root.screenName
             availableWidth: root.availableWidth > 0
@@ -229,6 +270,11 @@ Item {
             required property string modelData
             bar: root.bar
             entry: root.resolvedEntry(modelData)
+            hostEntry: GroupRegistry.hostEntryFor(
+              modelData, root.bar.layoutConfig)
+            settingsOverrides: GroupRegistry.settingsOverridesFor(
+              root.groupId, modelData, root.groupSettings,
+              root.bar.layoutConfig)
             region: root.groupId
             screenName: root.screenName
             availableWidth: root.availableWidth

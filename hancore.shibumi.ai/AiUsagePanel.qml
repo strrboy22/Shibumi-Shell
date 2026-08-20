@@ -21,10 +21,21 @@ ShibumiPanel {
   readonly property bool providerHasUsage: provider
     && (Number(provider.rateLimitPercent) >= 0
       || Number(provider.secondaryRateLimitPercent) >= 0)
-  readonly property bool providerHasData: provider
-    && (providerReady || providerHasUsage
+  readonly property bool providerHasCurrentData: provider && aiService
+    && typeof aiService.providerHasCurrentData === "function"
+    ? aiService.providerHasCurrentData(provider)
+    : provider && (providerHasUsage
       || Number(provider.todayTotalTokens) > 0
+      || Number(provider.todayPrompts) > 0
+      || Number(provider.todaySessions) > 0
       || providerModels.length > 0)
+  readonly property string providerEmptyStateText: !provider
+    ? "No supported AI usage data was found."
+    : providerHasCurrentData ? ""
+      : aiService && typeof aiService.providerCurrentDataMessage === "function"
+        ? aiService.providerCurrentDataMessage(provider)
+        : String(provider.authHelpText || "")
+          || "No current usage or limit data."
 
   owner: ownerWidget
   open: ownerWidget.opened
@@ -222,10 +233,9 @@ ShibumiPanel {
         }
 
         Text {
-          visible: !panel.provider || !panel.providerHasData
+          visible: panel.providerEmptyStateText !== ""
           width: parent.width
-          text: !panel.provider ? "No supported AI usage data was found."
-            : "no data - run " + panel.providerTabLabel(panel.provider).toLowerCase()
+          text: panel.providerEmptyStateText
           wrapMode: Text.WordWrap
           color: panel.controlMutedHigh
           font.family: panel.bar ? panel.bar.fontFamily : Commons.Style.font.family
@@ -273,13 +283,15 @@ ShibumiPanel {
         }
         DetailRow {
           visible: panel.provider && Number(panel.provider.windowTokens) > 0
-          label: "Tokens"
+          label: panel.provider && String(panel.provider.providerId || "")
+            === "opencode" ? "5h tokens" : "Tokens"
           value: visible && panel.aiService
             ? panel.aiService.formatTokens(panel.provider.windowTokens) : ""
         }
         DetailRow {
           visible: panel.provider && Number(panel.provider.hourlyTokens) > 0
-          label: "Rate"
+          label: panel.provider && String(panel.provider.providerId || "")
+            === "opencode" ? "1h rate" : "Rate"
           value: visible && panel.aiService
             ? panel.aiService.formatTokens(panel.provider.hourlyTokens) + "/h" : ""
         }
@@ -290,8 +302,21 @@ ShibumiPanel {
             ? panel.aiService.formatTokens(panel.provider.todayTotalTokens) + " tokens" : ""
         }
         DetailRow {
+          visible: panel.provider && Number(panel.provider.todayPrompts) > 0
+          label: "Today prompts"
+          value: visible ? String(Math.round(
+            Number(panel.provider.todayPrompts) || 0)) : ""
+        }
+        DetailRow {
+          visible: panel.provider && Number(panel.provider.todaySessions) > 0
+          label: "Today sessions"
+          value: visible ? String(Math.round(
+            Number(panel.provider.todaySessions) || 0)) : ""
+        }
+        DetailRow {
           visible: panel.provider && String(panel.provider.latestModel || "") !== ""
-          label: "Latest"
+          label: panel.provider && String(panel.provider.providerId || "")
+            === "opencode" ? "Latest today" : "Latest"
           value: panel.provider ? String(panel.provider.latestModel || "") : ""
         }
 
@@ -313,7 +338,8 @@ ShibumiPanel {
           Text {
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            text: "recent"
+            text: panel.provider && String(panel.provider.providerId || "")
+              === "opencode" ? "today" : "recent"
             color: panel.controlMuted
             font.family: panel.bar ? panel.bar.fontFamily : Commons.Style.font.family
             font.pixelSize: Commons.Style.font.caption

@@ -25,6 +25,8 @@ cp -a -- "$omarchy_path/shell/Ui" "$tmpdir/Ui"
 install -Dm0644 "$repo_root/tests/control-center-smoke.qml" "$tmpdir/shell.qml"
 install -Dm0644 "$repo_root/tests/fixtures/ControlCenterTestPanel.qml" \
   "$tmpdir/fixtures/ControlCenterTestPanel.qml"
+install -Dm0644 "$repo_root/tests/fixtures/PluginUpdateTestService.qml" \
+  "$tmpdir/control/PluginUpdateTestService.qml"
 install -Dm0755 "$repo_root/tests/fixtures/slow-health-report" \
   "$tmpdir/home/.config/omarchy/plugins/hancore.shibumi.control-center/manager/shibumi-health"
 mkdir -m 700 "$tmpdir/runtime"
@@ -78,9 +80,12 @@ rg -q 'root\.toggle\(\)' "$control_dir/BarWidget.qml" \
 rg -Fq 'readonly property bool animationActive: pointer.containsMouse' \
   "$control_dir/BarWidget.qml" \
   || fail "G1 background motion is not hover-only"
-rg -Fq 'readonly property bool nativePillSurfaceVisible: !stockOmarchyHost && !!(tokens' \
+rg -Fq 'readonly property bool nativePillSurfaceVisible: !stockOmarchyHost' \
   "$control_dir/BarWidget.qml" \
   || fail "stock Omarchy return icon inherits a Shibumi pill surface"
+rg -Fq 'readonly property color renderedPillFillColor:' \
+  "$control_dir/BarWidget.qml" \
+  || fail "G1 does not expose its V1 fill on the native pill surface"
 if rg -Fq 'pointer.containsMouse || opened' "$control_dir/BarWidget.qml"; then
   fail "G1 background motion still runs for the full panel lifetime"
 fi
@@ -101,10 +106,14 @@ rg -Fq 'source: Qt.resolvedUrl("assets/shibumi-icon-hikiryo.svg")' \
 rg -Fq 'width: root.stockOmarchyHost ? 18 : 16' \
   "$control_dir/BarWidget.qml" \
   || fail "stock Omarchy host icon is not pixel-centered in its even slot"
-if rg -A8 -F 'source: Qt.resolvedUrl("assets/shibumi-icon-hikiryo.svg")' \
-    "$control_dir/BarWidget.qml" | rg -Fq 'tint:'; then
-  fail "multicolor Hikiryō icon is flattened by a tint"
-fi
+for hikiryo_tone_contract in \
+  'root.launcherConfig.icon === "shibumi" && !root.v1CustomFill' \
+  'id: v1TintedLauncherIcon' \
+  '&& root.v1CustomFill' \
+  'tint: root.widgetInk'; do
+  rg -Fq "$hikiryo_tone_contract" "$control_dir/BarWidget.qml" \
+    || fail "Hikiryō V1 tone contract drifted: $hikiryo_tone_contract"
+done
 rg -Fq 'HostIdentity.shellName(bar)' "$control_dir/ControlCenterPanel.qml" \
   || fail "Bars page does not resolve the active host through Quattro shell state"
 rg -Fq 'readonly property real returnOnlyQuickPanelHeight:' \
@@ -126,6 +135,7 @@ for contract in \
   'ControlMainPage.qml:RUNTIME' \
   'ActiveBarSettingsPage.qml:BAR FORM' \
   'ActiveBarSettingsPage.qml:V1 LAYOUT' \
+  'ActiveBarSettingsPage.qml:V2 LAYOUT' \
   'ActiveBarSettingsPage.qml:GAP ANIMATIONS' \
   'BarSurfaceSettings.qml:BAR SURFACE' \
   'BarSurfaceSettings.qml:BAR ACCENT' \
@@ -160,6 +170,10 @@ fi
 for header_contract in \
   'ControlCenterPanel.qml:id: headerBand' \
   'ControlCenterPanel.qml:id: headerDivider' \
+  'ControlCenterPanel.qml:ActiveBarStatus {' \
+  'ActiveBarStatus.qml:stateService.paletteColor("color03")' \
+  'ActiveBarStatus.qml:"OMARCHY BAR ACTIVE"' \
+  'ActiveBarStatus.qml:"SHIBUMI V2 ACTIVE" : "SHIBUMI V1 ACTIVE"' \
   'ControlCenterPanel.qml:anchors.leftMargin: Commons.Style.space(20)' \
   'ControlCenterPanel.qml:anchors.rightMargin: Commons.Style.space(20)' \
   'ControlSettings.qml:anchors.leftMargin: Commons.Style.space(20)' \
@@ -192,40 +206,62 @@ for variant_memory_contract in \
   rg -Fq "$label" "$target_file" \
     || fail "V1/V2 style-memory contract drifted: $label"
 done
-rg -Fq 'restoreBar.scheduleWidgetRestore(' \
+for layout_protection_contract in \
+    'ShibumiConfig.js:function defaultLayoutProtectionConfig()' \
+    'Service.qml:function setLayoutProtection(variantValue, enabled)' \
+    'ControlCenterPanel.qml:function setLayoutProtection(variant, enabled)' \
+    'ActiveBarSettingsPage.qml:controller.setLayoutProtection(' \
+    'ActiveBarSettingsPage.qml:? controller.v2LayoutProtected === true' \
+    'ActiveBarSettingsPage.qml:: controller.v1LayoutProtected === true'; do
+  file=${layout_protection_contract%%:*}
+  label=${layout_protection_contract#*:}
+  target_file="$control_dir/$file"
+  [[ -f $target_file ]] || target_file="$repo_root/hancore.shibumi.state/$file"
+  rg -Fq "$label" "$target_file" \
+    || fail "V1/V2 layout protection contract drifted: $label"
+done
+rg -Fq 'restoreBar.scheduleOpenControlCenterRestores(' \
   "$control_dir/ControlCenterPanel.qml" \
   || fail "shell-style changes do not preserve the open Control Center page"
 rg -Fq 'presentationName === "shellStyle"' \
   "$control_dir/ControlCenterPanel.qml" \
   || fail "shell-style restore does not wait for the replacement panel owner"
-rg -Fq 'preservePage, true)' \
+rg -Fq 'settings.restorePage, true, ownerWidget, popoutScreenName' \
   "$control_dir/ControlCenterPanel.qml" \
-  || fail "V1/V2 restore does not wait for the replacement panel owner"
-rg -A14 -F 'function setBarPosition(value)' \
+  || fail "V1/V2 restore does not wait for replacement owners"
+layout_protection_controller=$(sed -n \
+  '/^  function setLayoutProtection(variant, enabled) {$/,/^  }$/p' \
+  "$control_dir/ControlCenterPanel.qml")
+for protection_restore_contract in \
+    'restoreBar.scheduleOpenControlCenterRestores' \
+    'settings.restorePage, false, ownerWidget, popoutScreenName' \
+    'restoreBar.cancelCreatedWidgetRestores(created)'; do
+  grep -Fq "$protection_restore_contract" \
+    <<<"$layout_protection_controller" \
+    || fail "layout lock restore drifted: $protection_restore_contract"
+done
+rg -A18 -F 'function setBarPosition(value, ownerValue, screenName)' \
     "$repo_root/hancore.shibumi.bar/Bar.qml" \
-  | rg -Fq 'root.scheduleWidgetRestore(' \
+  | rg -Fq 'root.scheduleOpenControlCenterRestores(' \
   || fail "Top/Bottom changes do not preserve the Control Center route"
-rg -Fq 'pendingWidgetRestoreAttempts < 20' \
-  "$repo_root/hancore.shibumi.bar/Bar.qml" \
-  || fail "V1/V2 restore window no longer covers late owner replacement"
-rg -Fq 'even after the first successful open' \
-  "$repo_root/hancore.shibumi.bar/Bar.qml" \
-  || fail "V1/V2 restore no longer protects a second panel-owner rebuild"
-rg -Fq 'property var pendingWidgetRestoreActiveOwner: null' \
-  "$repo_root/hancore.shibumi.bar/Bar.qml" \
-  || fail "V1/V2 restore does not track the established replacement owner"
-rg -Fq 'pendingWidgetRestorePage = currentPage' \
-  "$repo_root/hancore.shibumi.bar/Bar.qml" \
-  || fail "V1/V2 restore overwrites navigation performed during handoff"
-rg -Fq 'function trackWidgetRestorePage(pluginId, page)' \
-  "$repo_root/hancore.shibumi.bar/Bar.qml" \
-  || fail "V1/V2 restore does not preserve navigation during owner handoff"
+for output_restore_contract in \
+    'property var pendingWidgetRestores: []' \
+    'function widgetRestoreIndex(pluginId, owner, screenName)' \
+    'function widgetRestorePendingForOutput(pluginId, owner, screenName)' \
+    'function findPanelWidgetOnScreen(pluginId, screenName)' \
+    'record.activeOwner === owner' \
+    'function trackWidgetRestorePage(pluginId, page, ownerValue, screenName)' \
+    'if (record.attempts < 20) next.push(record)'; do
+  rg -Fq "$output_restore_contract" \
+    "$repo_root/hancore.shibumi.bar/Bar.qml" \
+    || fail "output-local panel restore drifted: $output_restore_contract"
+done
 rg -Fq 'controller.trackSettingsPage(next)' \
   "$control_dir/ControlSettings.qml" \
   || fail "Control Center navigation is not handed to the restore lifecycle"
-rg -Fq 'bar.cancelWidgetRestore(moduleName)' \
+rg -Fq 'bar.cancelWidgetRestore(moduleName, root, outputName)' \
   "$control_dir/BarWidget.qml" \
-  || fail "closing the Control Center does not cancel a pending restore"
+  || fail "closing the Control Center does not cancel its output-local restore"
 rg -Fq 'function runWithControlCenterRestore(callback)' \
   "$control_dir/ControlCenterPanel.qml" \
   || fail "widget Appearance changes do not preserve the Control Center"
@@ -235,7 +271,7 @@ plugin_bar_toggle=$(sed -n \
 grep -Fq 'return runWithControlCenterRestore(function() {' \
     <<<"$plugin_bar_toggle" \
   || fail "V1 plugin activation does not preserve the Control Center"
-rg -Fq 'restoreBar.scheduleWidgetRestore(' \
+rg -Fq 'restoreBar.scheduleOpenControlCenterRestores(' \
   "$control_dir/ControlCenterPanel.qml" \
   || fail "state mutations are not enrolled in panel-owner handoff"
 rg -Fq 'function trackControlCenterWidgetDetail(groupId, pluginId)' \
@@ -351,7 +387,7 @@ for configure_contract in \
   'ActiveBarSettingsPage.qml:property bool motionDetailOpen: false' \
   'ActiveBarSettingsPage.qml:columns: 3' \
   'ActiveBarSettingsPage.qml:motionEnabled && (selected || previewPointer.containsMouse)' \
-  'ActiveBarSettingsPage.qml:detail: "Add slots and place dividers"' \
+  'ActiveBarSettingsPage.qml:detail: "Add slots and dividers"' \
   'ControlSettings.qml:id: page.id === "main" ? "configure" : page.id' \
   'ControlCenterPanel.qml:: settings.restorePage === "configure" ? "CONFIGURE"'; do
   file=${configure_contract%%:*}
@@ -451,6 +487,11 @@ for contract in \
   'PluginCatalogPage.qml:title: root.favoritesOnly ? "Favorites" : "Plugins"' \
   'ControlSettings.qml:Add plugin' \
   'ControlSettings.qml:Install plugin from Git' \
+  'ControlSettings.qml:function extractInstallUrl(value)' \
+  'ControlSettings.qml:function pluginInstallCommand(value)' \
+  'ControlSettings.qml:if (repository !== "") return ""' \
+  'ControlSettings.qml:"omarchy", "plugin", "add", repository, "--yes"' \
+  'ControlSettings.qml:onEditingFinished: root.normalizeInstallInput()' \
   'ControlSettings.qml:Plugins run as unsandboxed code'; do
   file=${contract%%:*}
   label=${contract#*:}
@@ -484,7 +525,7 @@ for refined_contract in \
   'ActiveBarSettingsPage.qml:visible: root.v2Active' \
   'ActiveBarSettingsPage.qml:surfaceEffectOptionCount:' \
   'ActiveBarSettingsPage.qml:surfaceRadiusOptionCount:' \
-  'ControlSettings.qml:split gap slots divider separator full fit dock notch'; do
+  'ControlSettings.qml:protect protection lock split gap slots divider separator'; do
   file=${refined_contract%%:*}
   label=${refined_contract#*:}
   rg -Fq "$label" "$control_dir/$file" \
@@ -576,7 +617,9 @@ for favorite_contract in \
     'ControlSettings.qml:onFavoritesRequested: root.showPluginFavorites()' \
     'PluginCatalogPage.qml:property bool favoritesOnly: false' \
     'PluginCatalogPage.qml:function toggleFavoriteById(pluginId)' \
-    'WidgetModuleTile.qml:text: root.favorite ? "star" : "star_border"' \
+    'WidgetModuleTile.qml:controller.accentColor("color03")' \
+    'WidgetModuleTile.qml:favorite ? "󰓎" : "star_border"' \
+    'WidgetModuleTile.qml:font.family: "JetBrainsMono Nerd Font"' \
     'ControlCenterPanel.qml:function setPluginFavorite(pluginId, favorite)' \
     'Service.qml:function setPluginFavorite(pluginId, favorite)' \
     'ShibumiConfig.js:plugins: defaultPluginConfig()'; do
@@ -753,6 +796,19 @@ for route_contract in \
   'label: "Edit slots"' \
   'label: "Edit layout"' \
   'label: "Restore layout"' \
+  'label: "Lock V1 layout"' \
+  'label: "Lock V2 layout"' \
+  'readonly property bool activeLayoutProtected:' \
+  'readonly property int layoutActionCount:' \
+  'readonly property bool layoutActionLabelsFit:' \
+  'function toggleActiveLayoutProtection()' \
+  'component LayoutProtectionToggle: Rectangle' \
+  'Accessible.role: Accessible.CheckBox' \
+  'Accessible.checked: selected' \
+  'border.color: activeFocus ? foreground : selected' \
+  'layoutToggle.focus = false' \
+  'id: protectionTrack' \
+  'width: (parent.width - parent.spacing * 2) / 3' \
   'id: reactorRepeater'; do
   rg -Fq "$route_contract" "$control_dir/ActiveBarSettingsPage.qml" \
     || fail "active Bars drill-down drifted: $route_contract"
@@ -780,13 +836,13 @@ if [[ -z "$split_row_line" || -z "$position_row_line" \
     || "$split_row_line" -ge "$position_row_line" ]]; then
   fail "V1 split actions are no longer placed above bar position"
 fi
-if rg -q 'SLOT CAPACITY|V2 LAYOUT|v2SlotRepeater|controller\.(add|remove)V2Slot|Add slots and place dividers directly' \
+if rg -q 'SLOT CAPACITY|v2SlotRepeater|controller\.(add|remove)V2Slot|Add slots and place dividers directly' \
     "$control_dir/ActiveBarSettingsPage.qml"; then
   fail "Bars reintroduced redundant V2 layout or slot-capacity copy"
 fi
-if rg -q 'Choose the active V2 shape|V1 uses the Islands form' \
+if rg -q 'Choose the active V2 shape|V1 uses the Islands form|V1 supports positional slots' \
     "$control_dir/ActiveBarSettingsPage.qml"; then
-  fail "Bars reintroduced redundant copy below Bar Form"
+  fail "Bars reintroduced redundant copy below Bar Form or Layout"
 fi
 for v1_slot_contract in \
   'ControlCenterPanel.qml:v1LayoutSlots' \
@@ -849,7 +905,7 @@ rg -Fq 'visible: root.shibumiActive && !root.v2Active' \
 rg -Fq 'visible: root.v2Active' \
   "$control_dir/ActiveBarSettingsPage.qml" \
   || fail "V2 slot and divider controls are not capability-gated"
-rg -Fq 'detail: "Add slots and place dividers"' \
+rg -Fq 'detail: "Add slots and dividers"' \
   "$control_dir/ActiveBarSettingsPage.qml" \
   || fail "V2 edit mode does not explain its layout capability"
 
@@ -890,7 +946,7 @@ rg -Fq 'font.pixelSize: Commons.Style.space(24) * root.uiScale' \
   "$control_dir/PageHeaderHero.qml" \
   || fail "shared page-title typography drifted"
 
-rg -Fq '"omarchy", "plugin", "add", installUrl.trim(), "--yes"' \
+rg -Fq '"omarchy", "plugin", "add", repository, "--yes"' \
   "$control_dir/ControlSettings.qml" \
   || fail "Git plugin installation does not use Quattro's plugin contract"
 rg -Fq 'typeof pluginRegistry.setEnabled' \
@@ -1291,7 +1347,13 @@ for plugin_contract in \
     'id: feedbackCountdown' \
     'duration: 7000' \
     'paused: feedbackHover.hovered || undoButton.activeFocus' \
-    '(parent.width - 2) * root.feedbackProgress' \
+    'Math.max(0, Math.min(1, feedbackProgress))' \
+    'Commons.Style.space(4), Number(controller.controlRadius || 0))' \
+    'statusSlot.width - 2 * feedbackProgressInset' \
+    'id: feedbackProgressBar' \
+    'anchors.leftMargin: root.feedbackProgressInset' \
+    'anchors.bottomMargin: Commons.Style.space(2)' \
+    '* root.boundedFeedbackProgress' \
     'id: pluginSearch' \
     'height: Commons.Style.space(34)' \
     'border.color: root.controller.controlBorderColor' \
@@ -1303,11 +1365,24 @@ for plugin_contract in \
     'text: "REMOVE"' \
     'interval: 7000' \
     'function undoLastChange()' \
-    'controller.restoreShibumiProvider(undoGroup)' \
+    'undoMode === "provider-snapshot"' \
+    'controller.restoreProviderUndoSnapshot(undoProviderSnapshot)' \
+    'displacedProviderIds.length > 0' \
+    'controller.setProviderGroupStates(undoGroupStates)' \
+    'controller.restoreShibumiProviderStates(undoGroupStates)' \
+    'controller.restoreShibumiProviders(undoGroups)' \
     'actionLabel: "Add plugin"' \
     'onActionRequested: root.controller.openPluginInstaller()' \
-    'secondaryActionLabel: root.favoritesOnly ? "" : "Check plugin"' \
+    'secondaryActionLabel: root.favoritesOnly ? "" : "Check plugins"' \
     'secondaryActionGlyph: "refresh"' \
+    'secondaryActionStatusText: root.favoritesOnly ? ""' \
+    'secondaryActionDescription: root.favoritesOnly ? ""' \
+    'controller.pluginUpdateShortStatusText' \
+    'controller.pluginUpdateStatusText' \
+    'function syncPluginUpdateConsumer()' \
+    'service.acquireConsumer()' \
+    'service.releaseConsumer()' \
+    'Component.onDestruction:' \
     'actionWidth: Commons.Style.space(132)' \
     'onSecondaryActionRequested: root.controller.openPluginUpdater()' \
     'function providerCatalogCount(provider)' \
@@ -1351,16 +1426,50 @@ for plugin_height_contract in \
     || fail "Plugins compact panel-height contract drifted: $label"
 done
 for plugin_update_contract in \
+    'function checkPluginUpdates(force)' \
+    'effectivePluginUpdateService.check(force === true)' \
     'function openPluginUpdater()' \
+    'pluginUpdateCheckRunning) return false' \
     '"omarchy-launch-floating-terminal-with-presentation"' \
     'pluginUpdateCommand'; do
   rg -Fq "$plugin_update_contract" "$control_dir/ControlCenterPanel.qml" \
     || fail "manual plugin update action drifted: $plugin_update_contract"
 done
+rg -Fq 'hostShell.serviceFor("hancore.shibumi.control-center")' \
+  "$control_dir/BarWidget.qml" \
+  || fail 'plugin update status owner is not shared through the host service'
+jq -e '
+  (.kinds | index("service")) != null and
+  .entryPoints.service == "PluginUpdateService.qml"
+' "$control_dir/manifest.json" >/dev/null \
+  || fail 'control-center manifest does not declare its shared update service'
+for plugin_update_service_contract in \
+    'updateCheck.command = [' \
+    'command, "--list"' \
+    '"PLUGIN_UPDATE_COUNT"' \
+    '"PLUGIN_CHECKED_COUNT"' \
+    '"PLUGIN_UNMANAGED_COUNT"' \
+    '"PLUGIN_FETCH_FAILED_COUNT"' \
+    '? Date.now() : 0' \
+    'function acquireConsumer()' \
+    'function releaseConsumer()' \
+    'updateCheck.running = false' \
+    'function invalidate(rescan)' \
+    'const stale = finishedEpoch !== root.invalidationEpoch' \
+    'updateCount + " available"'; do
+  rg -Fq "$plugin_update_service_contract" \
+    "$control_dir/PluginUpdateService.qml" \
+    || fail "plugin update status service drifted: $plugin_update_service_contract"
+done
 for stacked_action_contract in \
     'anchors.left: root.secondaryActionLabel !== ""' \
     'anchors.left: parent.left' \
-    'anchors.leftMargin: Commons.Style.space(10)'; do
+    'anchors.leftMargin: Commons.Style.space(10)' \
+    'property string secondaryActionStatusText: ""' \
+    'property string secondaryActionDescription: ""' \
+    'Accessible.description: root.secondaryActionDescription' \
+    'anchors.top: secondaryAction.bottom' \
+    'text: root.secondaryActionStatusText'; do
   rg -Fq "$stacked_action_contract" "$control_dir/PageHeaderHero.qml" \
     || fail "stacked header actions lost their shared left edge"
 done
@@ -1371,7 +1480,11 @@ done
   "$control_dir/PageHeaderHero.qml") -eq 2 ]] \
   || fail "stacked header action icons must share one fixed column"
 for provider_model in \
-    'const replacementGroup = group === "" && bar' \
+    'const replacementGroups = group === "" && bar' \
+    'replacementGroups: replacementGroups' \
+    'replacementTargetStates: replacementTargetStates' \
+    'conflictingProviderIds: conflictingProviderIds' \
+    'conflictingProviderStates: conflictingProviderStates' \
     'replacementLabel: group === "" && bar' \
     'replacementTargetEnabled:' \
     'replacementInEffect: false' \
@@ -1381,6 +1494,14 @@ for provider_model in \
     '["omarchy", "plugin", "remove", id, "--yes"]' \
     'id: pluginRemoval' \
     'Control Center rejected non-removable plugin:' \
+    'function restoreShibumiProviders(groupValues)' \
+    'function restoreShibumiProviderStates(stateValues)' \
+    'function providerUndoSnapshot(pluginId)' \
+    'function restoreProviderUndoSnapshot(snapshotValue)' \
+    'function setProviderGroupStates(stateValues)' \
+    'removalPluginWasInBar = entry.barWidget === true' \
+    'panel.bar.removeBarWidgetAndRestoreFamilies(' \
+    'Plugin removed, but bar provider cleanup failed.' \
     'function restoreShibumiProvider(groupId)'; do
   rg -Fq "$provider_model" "$control_dir/ControlCenterPanel.qml" \
     || fail "plugin provider model drifted: $provider_model"
@@ -1510,7 +1631,7 @@ rg -Fq 'function beginBarEditing()' \
 rg -Fq 'visible: root.shibumiActive && !root.v2Active' \
   "$control_dir/ActiveBarSettingsPage.qml" \
   || fail "V1-only split and gap controls are not capability-gated"
-rg -Fq 'detail: "Add slots and place dividers"' \
+rg -Fq 'detail: "Add slots and dividers"' \
   "$control_dir/ActiveBarSettingsPage.qml" \
   || fail "V2 layout action does not explain its capability contract"
 if rg -Fq 'label: "Group separator"' "$control_dir/BarFunctionsPage.qml"; then
@@ -1607,8 +1728,7 @@ if rg -Fq 'text: "FINISH"' "$workbench"; then
 fi
 for compact_surface_row_contract in \
     'width: (parent.width - parent.spacing * 2) / 3' \
-    ': (parent.width - parent.spacing * 2) / 3 * 2' \
-    '+ parent.spacing' \
+    'width: root.v1LayoutActive ? parent.width' \
     'height: root.choiceRowHeight * 4' \
     'readonly property real surfaceChoiceHeight: choiceRowHeight * 4'; do
   rg -Fq "$compact_surface_row_contract" "$workbench" \
@@ -1646,14 +1766,18 @@ for profile_icon_contract in \
     'WidgetAppearanceWorkbench.qml:readonly property var v1CompactGroupIds:' \
     'WidgetAppearanceWorkbench.qml:if (catalogGroup === "G9") return mediaStyleOptions' \
     'WidgetAppearanceWorkbench.qml:if (controller.v2LayoutActive === true) return displayModeOptions' \
-    'WidgetAppearanceWorkbench.qml:{ value: "text", label: "Text", enabled: false }' \
+    'WidgetAppearanceWorkbench.qml:{ value: "full", label: "Default", enabled: true }' \
+    'WidgetAppearanceWorkbench.qml:{ value: "icon", label: "Compact", enabled: true }' \
+    'WidgetAppearanceWorkbench.qml:readonly property bool selectedV1Appearance:' \
+    'WidgetAppearanceWorkbench.qml:id: mediaContentToneChoices' \
     'WidgetAppearanceWorkbench.qml:enabled: radioList.enabled && radioRow.available' \
     'WidgetAppearanceWorkbench.qml:function isShibumiWidgetOption(source)' \
     'WidgetAppearanceWorkbench.qml:|| !isShibumiWidgetOption(source)' \
     'WidgetAppearanceWorkbench.qml:&& !root.v1LayoutActive' \
     'ControlCenterPanel.qml:stateService.groupAppearanceSettingForVariant' \
     'ControlCenterPanel.qml:stateService.setGroupAppearanceSettingForVariant' \
-    'ControlCenterPanel.qml:stateService.resetGroupAppearanceForVariant'; do
+    'ControlCenterPanel.qml:stateService.resetGroupAppearanceForVariant' \
+    'ControlCenterPanel.qml:stateService.resetAllGroupAppearancesForVariant'; do
   file=${profile_icon_contract%%:*}
   label=${profile_icon_contract#*:}
   rg -Fq "$label" "$control_dir/$file" \
@@ -1750,6 +1874,17 @@ for icons_drilldown_contract in \
   rg -Fq "$label" "$control_dir/$file" \
     || fail "Icons drill-down contract drifted: $label"
 done
+for bars_height_contract in \
+    'ControlSettings.qml:readonly property bool compactBarsPage:' \
+    'ControlSettings.qml:configureDetailPage === "bars"' \
+    'ControlSettings.qml:readonly property real compactBarsPanelHeight:' \
+    'ControlCenterPanel.qml:: settings.compactBarsPage' \
+    'ControlCenterPanel.qml:? fittedContentHeight(settings.compactBarsPanelHeight,'; do
+  file=${bars_height_contract%%:*}
+  label=${bars_height_contract#*:}
+  rg -Fq "$label" "$control_dir/$file" \
+    || fail "Bars no-scroll panel-height contract drifted: $label"
+done
 for icons_height_contract in \
     'WidgetAppearanceWorkbench.qml:readonly property int overviewRowCount:' \
     'BarFunctionsPage.qml:readonly property int widgetOverviewRowCount:' \
@@ -1820,13 +1955,71 @@ done
 for icons_hero_contract in \
     'PageHeaderHero.qml:property real preferredHeight:' \
     'PageHeaderHero.qml:property real previewWidth:' \
+    'PageMotionStage.qml:anchors.centerIn: parent' \
+    'BarFunctionsPage.qml:motionActive && !widgetDetailOpen' \
     'BarFunctionsPage.qml:preferredHeight: Commons.Style.space(80)' \
-    'BarFunctionsPage.qml:previewWidth: Commons.Style.space(150)'; do
+    'BarFunctionsPage.qml:previewWidth: Commons.Style.space(150)' \
+    'BarFunctionsPage.qml:resetActionVisible: root.resetActionVisible' \
+    'BarFunctionsPage.qml:resetActionColor: root.resetActionColor' \
+    'BarFunctionsPage.qml:controller.v2LayoutActive === true ? "v2" : "v1"' \
+    'BarFunctionsPage.qml:resetConfirmationPending ? "color01" : "color03"' \
+    'BarFunctionsPage.qml:function requestAppearanceReset()' \
+    'WidgetAppearanceWorkbench.qml:actionLabel: root.resetActionVisible' \
+    'WidgetAppearanceWorkbench.qml:text: "|"' \
+    'WidgetAppearanceWorkbench.qml:font.weight: Font.DemiBold' \
+    'WidgetAppearanceWorkbench.qml:font.letterSpacing: 1' \
+    'WidgetAppearanceWorkbench.qml:Accessible.onPressAction:' \
+    'WidgetAppearanceWorkbench.qml:!event.isAutoRepeat'; do
   file=${icons_hero_contract%%:*}
   label=${icons_hero_contract#*:}
   rg -Fq "$label" "$control_dir/$file" \
-    || fail "Icons compact hero contract drifted: $label"
+    || fail "Icons reset/header contract drifted: $label"
 done
+if rg -q 'utilityAction|previewVerticalOffset' \
+    "$control_dir/PageHeaderHero.qml" "$control_dir/PageMotionStage.qml"; then
+  fail "Icons reset still displaces or overlays the schematic preview"
+fi
+reset_repeat_guards=$(rg -c '!event\.isAutoRepeat' "$workbench")
+[[ $reset_repeat_guards -eq 3 ]] \
+  || fail "all three Icons reset keyboard paths must reject auto-repeat"
+rg -Fq 'height: Commons.Style.space(25)' "$workbench" \
+  || fail "Icons reset header target is smaller than 24 px"
+widget_tile_block=$(awk '
+  /component WidgetOptionTile: Rectangle/ { capture=1 }
+  /component WidgetMoveAction: FocusScope/ { capture=0 }
+  capture { print }
+' "$workbench")
+for tile_move_contract in \
+    'anchors.rightMargin: Commons.Style.space(27)' \
+    'id: moveAction' \
+    'anchors.right: parent.right' \
+    'anchors.top: parent.top' \
+    'anchors.bottom: parent.bottom'; do
+  grep -Fq "$tile_move_contract" <<<"$widget_tile_block" \
+    || fail "Icons tile move-action geometry drifted: $tile_move_contract"
+done
+move_action_block=$(awk '
+  /component WidgetMoveAction: FocusScope/ { capture=1 }
+  /component ContentCycleChoice: Rectangle/ { capture=0 }
+  capture { print }
+' "$workbench")
+for move_action_contract in \
+    'width: Commons.Style.space(22)' \
+    'clip: true' \
+    'root.controller.accentColor("color03")' \
+    'id: moveActionStrip' \
+    'anchors.fill: parent' \
+    'anchors.leftMargin: -root.controller.controlRadius' \
+    '? Commons.Util.alpha(moveActionControl.actionAccent, 0.18)' \
+    'Commons.Util.alpha(root.foreground, 0.06)' \
+    '? moveActionControl.actionAccent : root.foreground'; do
+  grep -Fq "$move_action_contract" <<<"$move_action_block" \
+    || fail "Icons move-action strip contract drifted: $move_action_contract"
+done
+if grep -Eq 'root\.controller\.dividerColor|border\.(width|color)' \
+    <<<"$move_action_block"; then
+  fail "Icons move-action strip restored a retired divider or hover border"
+fi
 if rg -q 'providerFilter|providerOptions|providerRepeater|chooseProvider' \
     "$workbench"; then
   fail "Icons editor still exposes provider filtering"
@@ -1863,6 +2056,9 @@ rg -Fq 'function resetGroupAppearance(groupId)' \
 rg -Fq 'function resetGroupAppearanceForVariant(groupId, variantValue)' \
   "$repo_root/hancore.shibumi.state/Service.qml" \
   || fail "profile-specific widget Appearance reset is missing"
+rg -Fq 'function resetAllGroupAppearancesForVariant(variantValue)' \
+  "$repo_root/hancore.shibumi.state/Service.qml" \
+  || fail "global profile-specific widget Appearance reset is missing"
 rg -Fq '"widgetBorderColor"' \
   "$repo_root/hancore.shibumi.state/Service.qml" \
   || fail "widget outline-color choice is not covered by appearance reset"

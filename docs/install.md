@@ -20,7 +20,7 @@ The exact accepted Omarchy and Quickshell packages are recorded in the
 ## Install from the Arch package
 
 > [!NOTE]
-> AUR registration is currently unavailable, so `0.1.1-beta.7` is not
+> AUR registration is currently unavailable, so `0.1.1-beta.8` is not
 > published there yet. This is the supported flow once AUR access returns and
 > the package is released.
 
@@ -143,8 +143,17 @@ git pull --ff-only
 
 An update requires a suite-managed Shibumi installation. It stages all 24
 current plugin roots as one transaction and verifies that the shell executes
-the accepted payload rather than a stale QML cache. For an external-bar
-installation, update preserves the active bar and layout.
+the accepted payload rather than a stale QML cache. For the managed Shibumi
+bar, the updater drains the shell before publishing live plugin roots, then
+starts it once; this prevents a plugin hot reload from overlapping IPC teardown.
+Hidden staging directories
+do not trigger Quattro's live plugin watcher. Immediately before replacing the
+live roots, the updater requires an authoritative lock status with `locked`,
+`requested`, `pending`, `sessionLocked`, and `secure` all explicitly false. An
+active, incomplete, malformed, or unavailable lock status aborts the update,
+discards staging, and leaves the live plugins unchanged; unlock the active
+session and retry. For an external-bar installation, update preserves the
+active bar and layout.
 
 ### Move from a checkout to the package
 

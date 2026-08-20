@@ -19,6 +19,8 @@ Ui.Panel {
     && typeof tokens.widgetContentColor === "function"
     ? tokens.widgetContentColor(settings, bar ? bar.urgent : "white")
     : (bar ? bar.urgent : "white")
+  readonly property string shellStyle: tokens
+    && tokens.shellStyle !== undefined ? String(tokens.shellStyle) : "shibumi"
   readonly property bool customDecorated: !!(tokens
     && ((typeof tokens.widgetHasFill === "function"
           && tokens.widgetHasFill(settings))
@@ -29,9 +31,21 @@ Ui.Panel {
     && tokens.widgetColorMode(settings) === "none")
   readonly property bool stockOmarchyHost:
     HostIdentity.isStockOmarchyHost(bar)
-  readonly property bool nativePillSurfaceVisible: !stockOmarchyHost && !!(tokens
-    && String(tokens.shellStyle || "shibumi") === "shibumi"
-    && !customDecorated && !surfaceDisabled)
+  readonly property bool nativePillSurfaceVisible: !stockOmarchyHost
+    && !!tokens && shellStyle === "shibumi"
+  readonly property bool v1CustomFill: nativePillSurfaceVisible && !!(tokens
+    && typeof tokens.widgetHasFill === "function"
+    && tokens.widgetHasFill(settings))
+  readonly property color v1FillColor: v1CustomFill
+    && typeof tokens.widgetFillColor === "function"
+    ? tokens.widgetFillColor(settings) : "transparent"
+  readonly property real v1FillOpacity: v1CustomFill
+    && typeof tokens.widgetSurfaceOpacity === "function"
+    ? tokens.widgetSurfaceOpacity(settings) : 1
+  readonly property color renderedPillFillColor: v1CustomFill
+    ? Qt.rgba(v1FillColor.r, v1FillColor.g, v1FillColor.b,
+        v1FillColor.a * v1FillOpacity)
+    : tokens && tokens.pill !== undefined ? tokens.pill : "transparent"
   readonly property var stateService: hostShell
     && typeof hostShell.serviceFor === "function"
     ? hostShell.serviceFor("hancore.shibumi.state") : null
@@ -39,6 +53,8 @@ Ui.Panel {
   readonly property int barSize: bar ? Number(bar.barSize || 0) : 0
   readonly property bool panelLoaded: panelLoader.item !== null
   readonly property var panelItem: panelLoader.item
+  readonly property bool v1TintedLauncherIconVisible:
+    v1TintedLauncherIcon.visible
   readonly property bool animationActive: pointer.containsMouse
   readonly property var launcherConfig: stateService && stateService.config
     && stateService.config.launcher
@@ -83,6 +99,11 @@ Ui.Panel {
     : shibumiWordmark ? Math.ceil(shibumiMetrics.advanceWidth)
       : archWordmark ? archWordmarkWidth : Math.round(logoHeight * wordmarkAspect)
   property url panelSource: Qt.resolvedUrl("ControlCenterPanel.qml")
+  property var pluginUpdateServiceOverride: null
+  readonly property var activePluginUpdateService:
+    pluginUpdateServiceOverride || (hostShell
+      && typeof hostShell.serviceFor === "function"
+      ? hostShell.serviceFor("hancore.shibumi.control-center") : null)
   property real phase: 0
   property var registeredBar: null
   property string pendingPage: ""
@@ -111,6 +132,8 @@ Ui.Panel {
     if ("stateService" in item) item.stateService = root.stateService
     if ("healthService" in item) item.healthService = healthState
     if ("switchService" in item) item.switchService = switchState
+    if ("pluginUpdateService" in item)
+      item.pluginUpdateService = activePluginUpdateService
   }
 
   function syncPanelLoader() {
@@ -132,7 +155,8 @@ Ui.Panel {
       ownerWidget: root,
       stateService: root.stateService,
       healthService: healthState,
-      switchService: switchState
+      switchService: switchState,
+      pluginUpdateService: activePluginUpdateService
     })
   }
 
@@ -163,8 +187,12 @@ Ui.Panel {
   }
 
   function close() {
-    if (bar && typeof bar.cancelWidgetRestore === "function")
-      bar.cancelWidgetRestore(moduleName)
+    if (bar && typeof bar.cancelWidgetRestore === "function") {
+      const window = root.QsWindow ? root.QsWindow.window : null
+      const outputName = window && window.screen
+        ? String(window.screen.name || "") : ""
+      bar.cancelWidgetRestore(moduleName, root, outputName)
+    }
     controller.hide()
   }
 
@@ -252,7 +280,7 @@ Ui.Panel {
     height: root.tokens ? root.tokens.pillHeight : 24
     radius: root.tokens ? root.tokens.pillRadius : 12
     color: root.nativePillSurfaceVisible
-      ? root.tokens.pill : "transparent"
+      ? root.renderedPillFillColor : "transparent"
     border.color: root.nativePillSurfaceVisible
       ? root.tokens.pillBorder : "transparent"
     border.width: root.nativePillSurfaceVisible
@@ -394,7 +422,7 @@ Ui.Panel {
 
     Image {
       visible: root.stockOmarchyHost
-        || root.launcherConfig.icon === "shibumi"
+        || (root.launcherConfig.icon === "shibumi" && !root.v1CustomFill)
       anchors.centerIn: parent
       width: 18
       height: 18
@@ -404,6 +432,18 @@ Ui.Panel {
       sourceSize.height: 24
       smooth: true
       mipmap: true
+    }
+
+    FlatTintedImage {
+      id: v1TintedLauncherIcon
+      visible: !root.stockOmarchyHost
+        && root.launcherConfig.icon === "shibumi"
+        && root.v1CustomFill
+      anchors.centerIn: parent
+      width: 18
+      height: 18
+      source: Qt.resolvedUrl("assets/shibumi-icon-hikiryo.svg")
+      tint: root.widgetInk
     }
   }
 

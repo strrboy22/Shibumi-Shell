@@ -15,6 +15,21 @@ Column {
   property string selectedWidgetGroup: "G4"
   property string selectedWidgetId: ""
   property bool widgetDetailOpen: false
+  property string resetConfirmationVariant: ""
+  readonly property string activeResetVariant:
+    controller.v2LayoutActive === true ? "v2" : "v1"
+  readonly property bool resetActionVisible:
+    motionActive && !widgetDetailOpen
+      && String(controller.activeShell || "") === "shibumi"
+  readonly property bool resetConfirmationPending:
+    resetConfirmationVariant === activeResetVariant
+  readonly property string resetVariantLabel:
+    activeResetVariant.toUpperCase()
+  readonly property string resetActionLabel: resetConfirmationPending
+    ? "CONFIRM " + resetVariantLabel + " RESET"
+    : "RESET " + resetVariantLabel + " DEFAULTS"
+  readonly property color resetActionColor: controller.accentColor(
+    resetConfirmationPending ? "color01" : "color03")
   readonly property var widgetOptions: WidgetCatalog.AppearanceOptions
   readonly property bool workbenchReady: appearanceWorkbench.ready
   readonly property int widgetOptionCount: widgetOptions.length
@@ -28,6 +43,12 @@ Column {
     appearanceWorkbench.selectedActive
   readonly property string selectedWidgetMode:
     appearanceWorkbench.selectedDisplayMode
+  readonly property var selectedWidgetModeOptions:
+    appearanceWorkbench.selectedModeOptions
+  readonly property bool selectedV1Appearance:
+    appearanceWorkbench.selectedV1Appearance
+  readonly property bool selectedV1CpuCompact:
+    appearanceWorkbench.selectedV1CpuCompact
   readonly property string selectedWidgetSurface:
     appearanceWorkbench.selectedSurfaceMode
   readonly property string selectedWidgetTone:
@@ -44,6 +65,35 @@ Column {
 
   width: parent ? parent.width : 1
   spacing: Commons.Style.space(10)
+
+  onResetActionVisibleChanged: {
+    if (!resetActionVisible) clearResetConfirmation()
+  }
+  onActiveResetVariantChanged: clearResetConfirmation()
+
+  Timer {
+    id: resetConfirmationTimer
+    interval: 4200
+    onTriggered: root.resetConfirmationVariant = ""
+  }
+
+  function clearResetConfirmation() {
+    resetConfirmationTimer.stop()
+    resetConfirmationVariant = ""
+  }
+
+  function requestAppearanceReset() {
+    if (!resetActionVisible) return false
+    const variant = activeResetVariant
+    if (!resetConfirmationPending) {
+      resetConfirmationVariant = variant
+      resetConfirmationTimer.restart()
+      return true
+    }
+    clearResetConfirmation()
+    return typeof controller.resetAllGroupAppearances === "function"
+      ? controller.resetAllGroupAppearances(variant) : false
+  }
 
   function cycleSelectedWidgetMode() {
     return appearanceWorkbench.cycleWidgetMode()
@@ -109,6 +159,9 @@ Column {
     uiScale: root.uiScale
     foreground: root.foreground
     accent: root.accent
+    resetActionVisible: root.resetActionVisible
+    resetActionLabel: root.resetActionLabel
+    resetActionColor: root.resetActionColor
     selectedWidgetGroup: root.selectedWidgetGroup
     selectedWidgetId: root.selectedWidgetId
     detailOpen: root.widgetDetailOpen
@@ -120,5 +173,6 @@ Column {
       root.openWidgetDetails(groupId, pluginId)
     }
     onOverviewRequested: root.showWidgetOverview()
+    onResetActionRequested: root.requestAppearanceReset()
   }
 }

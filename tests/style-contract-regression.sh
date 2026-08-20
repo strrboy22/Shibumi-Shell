@@ -87,9 +87,17 @@ for edit_contract in \
   rg -Fq "$edit_contract" styles/shibumi/BarSurface.qml \
     || fail "edit-mode frame drifted from V1: $edit_contract"
 done
-rg -Fq 'enabled: root.persistentSeparators || !root.v2Mode' \
-  styles/shibumi/GroupSection.qml \
-  || fail "within-region separators are not live in V1 and persistent in V2"
+for protection_contract in \
+  'readonly property bool separatorChangesAllowed: editing || !layoutProtected' \
+  'if (!separatorChangesAllowed) return false' \
+  'enabled: root ? root.persistentSeparators || !root.v2Mode : false' \
+  'hoverEnabled: root ? root.separatorChangesAllowed : false' \
+  'readonly property int enabledSeparatorHitTargetCount:' \
+  'bar.toggleGroupSeparator(String(groupId || ""), editing)' \
+  'bar.layoutController.toggleSplit(region, Number(index), editing)'; do
+  rg -Fq "$protection_contract" styles/shibumi/GroupSection.qml \
+    || fail "within-region layout protection drifted: $protection_contract"
+done
 for stable_group_contract in \
   'ListModel { id: stableGroupModel }' \
   'function syncStableGroups()' \
@@ -105,21 +113,20 @@ fi
 rg -Fq 'onClicked: root.bar.toggleGroupSeparator(' \
   styles/shibumi/GroupSection.qml && \
   fail "separator click bypasses the V2 interaction guard"
-rg -Fq 'onClicked: root.toggleSeparator(' \
+rg -Uq 'onClicked: \{\n[[:space:]]*if \(root\) root\.toggleSeparator\(' \
   styles/shibumi/GroupSection.qml \
   || fail "within-region markers do not use the guarded interaction route"
 for v1_edit_interaction_contract in \
   'return !v2Mode && bar.layoutController' \
-  'bar.layoutController.toggleSplit(region, Number(index))' \
   'function onSlotEditingChanged()' \
-  'enabled: !root.slotEditing'; do
+  'enabled: root ? !root.slotEditing : false'; do
   rg -Fq "$v1_edit_interaction_contract" styles/shibumi/GroupSection.qml \
     || fail "V1 edit interaction drifted: $v1_edit_interaction_contract"
 done
 rg -Fq 'return separated ? Math.max(0, splitGrow - groupSpacing)' \
   styles/shibumi/GroupSection.qml \
   || fail "active separators no longer follow the original V2 edge offset"
-rg -Fq 'width: horizontalCell.placeholderSlot ? root.slotVisualSize : 0' \
+rg -Fq 'width: root && horizontalCell.placeholderSlot' \
   styles/shibumi/GroupSection.qml \
   || fail "edit placeholder does not use the presentation-specific slot size"
 rg -Fq 'height: root.v2Shell' core/GroupSlot.qml \
@@ -146,8 +153,8 @@ for slot_add_contract in \
     || fail "inline add-slot affordance drifted: $slot_add_contract"
 done
 for v1_slot_contract in \
-  'readonly property bool proxySlot: root.v1Editing' \
-  'readonly property bool removableEmptySlot: emptySlot' \
+  'readonly property bool proxySlot: root' \
+  'readonly property bool removableEmptySlot: root && emptySlot' \
   '? root.v2Mode ? targetVisual.height : 32 : 0' \
   'anchors.verticalCenter: parent.verticalCenter' \
   'root.bar.layoutController.removeV1SlotAt(' \
@@ -155,9 +162,14 @@ for v1_slot_contract in \
   rg -Fq "$v1_slot_contract" styles/shibumi/GroupSection.qml \
     || fail "V1 editable slot proxy drifted: $v1_slot_contract"
 done
-rg -Fq 'enabled: true' \
-  styles/shibumi/BarSurface.qml \
-  || fail "boundary separators are not live in V1 and locked V2 modes"
+for boundary_protection_contract in \
+  'readonly property bool layoutChangesAllowed:' \
+  'if (!root.layoutChangesAllowed) return false' \
+  'enabled: root.layoutChangesAllowed' \
+  'root.layoutSession && root.layoutSession.editing'; do
+  rg -Fq "$boundary_protection_contract" styles/shibumi/BarSurface.qml \
+    || fail "boundary layout protection drifted: $boundary_protection_contract"
+done
 for v1_boundary_contract in \
   'visible: root.bar.layoutController.v2Mode !== true' \
   '&& boundaryMarker.splitOn ? "│" : "•"'; do
@@ -252,7 +264,7 @@ for inactive_drag_contract in \
     | rg -Fq "$inactive_drag_contract" \
     || fail "inactive drag handles can own the cursor: $inactive_drag_contract"
 done
-rg -Fq 'radius: root.bar.visualTokens.pillRadius' \
+rg -Fq 'radius: root ? root.bar.visualTokens.pillRadius : 0' \
   styles/shibumi/GroupSection.qml \
   || fail "drop targets do not follow the selected V1 radius"
 rg -Fq '? tokenNumber("tileRadius", 8) : tokenNumber("pillRadius", 12)' \
@@ -266,10 +278,19 @@ for v1_host_contract in \
 done
 for dynamic_v1_contract in \
   'readonly property bool dynamicV1Group:' \
-  'visible: root.decorated || root.dynamicV1Group' \
+  'readonly property bool dynamicV1WidgetOwnsSurface:' \
+  'readonly property bool dynamicV1CustomFill:' \
+  '"hancore.shibumi.temperature"' \
+  '"hancore.shibumi.gpu"' \
+  '"hancore.shibumi.storage"' \
+  '|| (root.dynamicV1Group && !root.dynamicV1WidgetOwnsSurface)' \
   'root.bar.visualTokens.pillBorderWidth' \
+  'readonly property bool dynamicShadowLoaded:' \
+  'id: dynamicShadowLoader' \
+  'active: root.dynamicV1Group && !root.dynamicV1WidgetOwnsSurface' \
+  'sourceComponent: active ? dynamicV1Shadow : null' \
+  'id: dynamicV1Shadow' \
   'RectangularShadow {' \
-  'visible: root.dynamicV1Group && root.bar.visualTokens' \
   'root.bar.visualTokens.shadowEnabled === true'; do
   rg -Fq "$dynamic_v1_contract" core/GroupSlot.qml \
     || fail "dynamic V1 plugins lost standard pill chrome: $dynamic_v1_contract"
@@ -290,6 +311,8 @@ rg -Fq '? tokenNumber("slotHeight", 28) : tokenNumber("pillHeight", 24)' \
 for pill_contract in \
   'property var settings: ({})' \
   'property var tokenSource: null' \
+  'property bool v1AppearanceEnabled: false' \
+  'readonly property bool v1CustomFill:' \
   'readonly property bool customDecorated:' \
   'readonly property bool surfaceDisabled:' \
   'readonly property bool shellPillVisible: shellStyle === "shibumi"' \
@@ -333,6 +356,9 @@ for shape_tokens in \
     shared/presentation/HostTokens.qml; do
   rg -Fq 'if (value === "round") return pillHeight / 2' "$shape_tokens" \
     || fail "V2 Round shape is not half the widget surface: $shape_tokens"
+  rg -Fq 'if (!v2Shell) return widgetColorId(settings) !== "inherit"' \
+    "$shape_tokens" \
+    || fail "V1 fill can still be disabled by hidden V2 state: $shape_tokens"
 done
 for widget in ai audio battery bluetooth brightness center cpu gpu media \
     memory network power-profile quick-access status storage temperature \
@@ -343,11 +369,16 @@ for widget in ai audio battery bluetooth brightness center cpu gpu media \
   rg -Fq 'tokenSource: root.tokens' \
     "hancore.shibumi.$widget/BarWidget.qml" \
     || fail "$widget does not pass its resolved host tokens to its pill"
+  rg -Fq 'v1AppearanceEnabled: true' \
+    "hancore.shibumi.$widget/BarWidget.qml" \
+    || fail "$widget does not opt into V1 fill appearance"
 done
 for launcher_contract in \
   'readonly property bool customDecorated:' \
   'readonly property bool surfaceDisabled:' \
-  'readonly property bool nativePillSurfaceVisible:'; do
+  'readonly property bool nativePillSurfaceVisible:' \
+  'readonly property bool v1CustomFill:' \
+  'readonly property color renderedPillFillColor:'; do
   rg -Fq "$launcher_contract" \
     hancore.shibumi.control-center/BarWidget.qml \
     || fail "Control Center appearance surface drifted: $launcher_contract"
@@ -594,10 +625,14 @@ fi
 for ai_contract in \
   'readonly property int providerIconSlotWidth: 20' \
   'readonly property int providerIconSlotHeight: 16' \
+  'readonly property int claudeGlyphPixelSize: 15' \
   'width: root.providerIconSlotWidth' \
   'height: root.providerIconSlotHeight' \
   'width: root.providerGlyphWidth' \
   'height: root.providerGlyphHeight' \
+  'readonly property int providerContentHorizontalOffset:' \
+  'providerId === "codex" && displayMode !== "text" ? -1 : 0' \
+  'anchors.horizontalCenterOffset: root.providerContentHorizontalOffset' \
   'anchors.horizontalCenterOffset: root.providerGlyphHorizontalOffset' \
   '? Qt.size(20, 12) : Qt.size(56, 56)' \
   'readonly property color baseIconColor: customFillActive' \
@@ -607,6 +642,7 @@ for ai_contract in \
   'readonly property bool claudeLayersAligned:' \
   'color: Qt.rgba(root.baseIconColor.r,' \
   'color: root.usageIconColor' \
+  'font.pixelSize: root.claudeGlyphPixelSize' \
   'x: claudeGlyphBase.x' \
   'y: claudeGlyphBase.y - claudeUsageClip.y' \
   'width: claudeGlyphBase.width' \
@@ -619,6 +655,9 @@ for ai_contract in \
   rg -Fq "$ai_contract" hancore.shibumi.ai/BarWidget.qml \
     || fail "AI icon contract drifted from V1: $ai_contract"
 done
+[[ $(rg -Fc 'font.pixelSize: root.claudeGlyphPixelSize' \
+  hancore.shibumi.ai/BarWidget.qml) -eq 2 ]] \
+  || fail "Claude base/fill layers do not share the 15px glyph size"
 if rg -Fq 'tint: root.widgetInk' hancore.shibumi.ai/BarWidget.qml \
     || rg -Uq 'text: "\\udb85\\ude7a"\n[[:space:]]+color: (Qt\.rgba\(root\.widgetInk|root\.widgetInk)' \
       hancore.shibumi.ai/BarWidget.qml; then
@@ -634,9 +673,9 @@ rg -Fq 'font.pixelSize: 14' hancore.shibumi.quick-access/BarWidget.qml \
   || fail "picker icon sizing drifted from V1"
 rg -Fq 'font.pixelSize: 13' hancore.shibumi.media/BarWidget.qml \
   || fail "media control icon sizing drifted from V1"
-rg -Fq 'Commons.Util.alpha(root.tokens.ink, 0.5)' \
+rg -Fq 'Commons.Util.alpha(root.widgetInk, 0.5)' \
   hancore.shibumi.center/BarWidget.qml \
-  || fail "center date color drifted from the V1 half-opacity foreground"
+  || fail "center date no longer follows the half-opacity content tone"
 
 # The four V2 shells use the original V2 module language: symbol plus value,
 # without the V1 acronym prefixes. Shibumi itself keeps those V1 labels.
@@ -652,6 +691,9 @@ for widget in audio battery brightness power-profile bluetooth; do
 done
 rg -Fq 'text: "󰋊"' hancore.shibumi.storage/BarWidget.qml \
   || fail "storage bar icon drifted from the original V2 glyph"
+rg -Fq 'readonly property int iconSlotSize: 14' \
+  hancore.shibumi.storage/BarWidget.qml \
+  || fail "storage icon lost its stable optical slot"
 if rg -Fq 'text: "HDD "' hancore.shibumi.storage/BarWidget.qml; then
   fail "storage bar restored the obsolete HDD prefix"
 fi
@@ -678,13 +720,22 @@ if rg -Fq 'text: "GPU "' hancore.shibumi.gpu/BarWidget.qml; then
   fail "GPU bar restored the obsolete GPU prefix"
 fi
 rg -Fq 'text: ""' hancore.shibumi.temperature/BarWidget.qml \
-  || fail "temperature bar icon drifted from the original V2 glyph"
+  || fail "temperature bar icon drifted from the shared Nerd Font glyph"
+if rg -q 'device_thermostat|v1TemperatureIcon|v2TemperatureIcon' \
+    hancore.shibumi.temperature/BarWidget.qml; then
+  fail "temperature still switches icon families between V1 and V2"
+fi
+rg -Fq 'font.family: root.bar' hancore.shibumi.temperature/BarWidget.qml \
+  || fail "temperature icon does not use the configured Nerd Font"
 rg -Fq 'readonly property int iconSlotSize: 14' \
   hancore.shibumi.temperature/BarWidget.qml \
   || fail "temperature icon lost its stable optical slot"
 rg -Fq 'anchors.horizontalCenterOffset: root.iconGlyphHorizontalOffset' \
   hancore.shibumi.temperature/BarWidget.qml \
   || fail "temperature glyph lost its optical slot offset"
+rg -Fq 'tokens.v2Shell === true ? 2 : 3' \
+  hancore.shibumi.temperature/BarWidget.qml \
+  || fail "temperature glyph lost its V1/V2 trailing-edge alignment"
 rg -Fq '&& tokens.v2Shell !== true ? -1 : 0' \
   hancore.shibumi.temperature/BarWidget.qml \
   || fail "temperature lost its V1 optical alignment offset"

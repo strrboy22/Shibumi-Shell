@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -63,6 +64,19 @@ from shibumi_suite.transaction import (  # noqa: E402
 
 
 QUICKSHELL_EMPTY_REGISTRY = "No running instances.\n"
+SESSION_LOCK_FIELDS = (
+    "locked",
+    "requested",
+    "pending",
+    "sessionLocked",
+    "secure",
+)
+
+
+def unlocked_session_status() -> dict[str, bool]:
+    return dict.fromkeys(SESSION_LOCK_FIELDS, False)
+
+
 INVALID_EMPTY_REGISTRY_OUTPUTS = (
     "",
     "No running instances.",
@@ -95,6 +109,9 @@ class FakeOmarchyRuntime(OmarchyRuntime):
         self.menu_refreshes = 0
         self.shell_running = True
         self.restart_failure_stops_shell = False
+        self.session_lock_status = unlocked_session_status()
+        self.session_lock_failure = ""
+        self.session_lock_preflights = 0
         self.events: list[str] = []
 
     def validate_plugin(self, directory: Path) -> None:
@@ -105,6 +122,19 @@ class FakeOmarchyRuntime(OmarchyRuntime):
             "." + str(manifest.get("id"))
         ):
             raise RuntimeFailure(f"invalid staged plugin {directory}")
+
+    def require_session_unlocked(self, operation: str) -> None:
+        self.session_lock_preflights += 1
+        if self.session_lock_failure:
+            raise RuntimeFailure(self.session_lock_failure)
+        active = [
+            name for name, value in self.session_lock_status.items() if value is True
+        ]
+        if active:
+            raise RuntimeFailure(
+                f"refusing {operation} while the Omarchy session lock is active "
+                f"({', '.join(active)}); unlock the session and retry"
+            )
 
     def rescan(self) -> None:
         self.events.append("rescan")
@@ -241,9 +271,8 @@ class RuntimeProcessTests(unittest.TestCase):
         self.omarchy_root = Path(self.temporary.name) / "omarchy"
         bin_dir = self.omarchy_root / "bin"
         bin_dir.mkdir(parents=True)
-        (bin_dir / "omarchy-restart-shell").write_text(
-            "#!/bin/sh\n", encoding="utf-8"
-        )
+        for command in ("omarchy-restart-shell", "omarchy-shell"):
+            (bin_dir / command).write_text("#!/bin/sh\n", encoding="utf-8")
         self.runtime = OmarchyRuntime(self.omarchy_root)
 
     def tearDown(self) -> None:
@@ -281,6 +310,76 @@ class RuntimeProcessTests(unittest.TestCase):
         self.assertNotIn([str(
             self.omarchy_root / "bin/omarchy-shell"
         ), "shell", "ping"], calls)
+
+    def test_session_lock_preflight_accepts_only_explicitly_unlocked_status(
+        self,
+    ) -> None:
+        status = unlocked_session_status()
+        self.runtime.run = Mock(return_value=self.result(json.dumps(status)))
+
+        self.runtime.require_session_unlocked("Shibumi update")
+
+        self.runtime.run.assert_called_once_with(
+            [str(self.omarchy_root / "bin/omarchy-shell"), "lock", "status"],
+            timeout=4,
+            check=False,
+        )
+
+    def test_session_lock_preflight_rejects_every_active_phase(self) -> None:
+        idle = unlocked_session_status()
+        for field in SESSION_LOCK_FIELDS:
+            with self.subTest(field=field):
+                status = dict(idle)
+                status[field] = True
+                self.runtime.run = Mock(
+                    return_value=self.result(json.dumps(status))
+                )
+
+                with self.assertRaisesRegex(
+                    RuntimeFailure,
+                    rf"session lock is active \({field}\)",
+                ):
+                    self.runtime.require_session_unlocked("Shibumi update")
+
+    def test_session_lock_preflight_fails_closed_for_unknown_status(self) -> None:
+        idle = unlocked_session_status()
+        cases = (
+            self.result("not-json"),
+            self.result("[]"),
+            self.result(json.dumps({"locked": False})),
+            self.result(json.dumps({**idle, "secure": 0})),
+            self.result(
+                '{"locked":true,"locked":false,"requested":false,'
+                '"pending":false,"sessionLocked":false,"secure":false}'
+            ),
+            *(
+                self.result(
+                    '{"locked":false,"requested":false,"pending":false,'
+                    '"sessionLocked":false,"secure":false,"extra":'
+                    + constant
+                    + "}"
+                )
+                for constant in ("NaN", "Infinity", "-Infinity")
+            ),
+            self.result(stderr="IPC unavailable", returncode=1),
+        )
+        for result in cases:
+            with self.subTest(stdout=result.stdout, returncode=result.returncode):
+                self.runtime.run = Mock(return_value=result)
+                with self.assertRaisesRegex(
+                    RuntimeFailure,
+                    "cannot verify that the session is unlocked",
+                ):
+                    self.runtime.require_session_unlocked("Shibumi update")
+
+        self.runtime.run = Mock(
+            side_effect=RuntimeFailure("injected IPC timeout")
+        )
+        with self.assertRaisesRegex(
+            RuntimeFailure,
+            "cannot verify that the session is unlocked.*injected IPC timeout",
+        ):
+            self.runtime.require_session_unlocked("Shibumi update")
 
     def test_instance_guard_ignores_foreign_config_but_rejects_duplicates(self) -> None:
         config = self.omarchy_root / "shell/shell.qml"
@@ -501,6 +600,30 @@ class SuiteLifecycleTests(unittest.TestCase):
         self.assertEqual(
             command_install(self.args(), self.suite, self.paths, self.runtime), 0
         )
+
+    def test_fresh_install_does_not_create_stock_transparency_preference(
+        self,
+    ) -> None:
+        defaults = json.loads(self.defaults.read_text(encoding="utf-8"))
+        defaults["bar"]["transparent"] = False
+        self.defaults.write_text(
+            json.dumps(defaults, indent=2) + "\n", encoding="utf-8"
+        )
+        self.assertFalse(self.paths.config_file.exists())
+
+        self.install()
+        installed = json.loads(self.paths.config_file.read_text(encoding="utf-8"))
+        state = load_install_state(self.paths, self.suite)
+        self.assertNotIn("transparent", installed["bar"])
+        self.assertNotIn("transparent", state["previousBar"])
+
+        self.assertEqual(
+            command_uninstall(self.args(), self.suite, self.paths, self.runtime), 0
+        )
+        uninstalled = json.loads(
+            self.paths.config_file.read_text(encoding="utf-8")
+        )
+        self.assertNotIn("transparent", uninstalled["bar"])
 
     def test_lifecycle_never_mutates_hyprland_appearance_config(self) -> None:
         hypr_root = self.root / "config/hypr"
@@ -725,6 +848,49 @@ class SuiteLifecycleTests(unittest.TestCase):
             return []
         return sorted(self.paths.plugin_dir.glob(".shibumi-*"))
 
+    @staticmethod
+    def tree_snapshot(
+        root: Path,
+    ) -> tuple[tuple[str, str, bytes | str | None], ...]:
+        entries: list[tuple[str, str, bytes | str | None]] = []
+
+        def visit(path: Path, relative: str) -> None:
+            if path.is_symlink():
+                entries.append((relative, "symlink", str(path.readlink())))
+            elif path.is_dir():
+                entries.append((relative, "directory", None))
+                for child in sorted(path.iterdir(), key=lambda item: item.name):
+                    visit(child, str(child.relative_to(root)))
+            elif path.is_file():
+                entries.append((relative, "file", path.read_bytes()))
+            elif path.exists():
+                entries.append((relative, "other", None))
+
+        visit(root, ".")
+        return tuple(entries)
+
+    def managed_state_snapshot(self) -> dict[str, object]:
+        return {
+            "plugins": self.tree_snapshot(self.paths.plugin_dir),
+            "config": self.tree_snapshot(self.paths.config_file),
+            "state": self.tree_snapshot(self.paths.state_dir),
+            "menuExtension": self.tree_snapshot(
+                self.paths.menu_extension_file
+            ),
+        }
+
+    def runtime_activity_snapshot(self) -> dict[str, object]:
+        return {
+            "events": tuple(self.runtime.events),
+            "rescans": self.runtime.rescans,
+            "reloads": self.runtime.reloads,
+            "restarts": self.runtime.restarts,
+            "stops": self.runtime.stops,
+            "payloadReloads": self.runtime.payload_reloads,
+            "menuRefreshes": self.runtime.menu_refreshes,
+            "shellRunning": self.runtime.shell_running,
+        }
+
     def test_menu_extension_merge_is_idempotent_and_reversible(self) -> None:
         original = (
             "{\n"
@@ -805,8 +971,8 @@ class SuiteLifecycleTests(unittest.TestCase):
         state = load_install_state(self.paths, suite)
         self.assertEqual(state["installOrigin"], "package")
         self.assertEqual(state["packageName"], "shibumi-shell")
-        self.assertEqual(state["packageVersion"], "0.1.1-beta.7")
-        self.assertEqual(state["sourceRevision"], "package:0.1.1-beta.7")
+        self.assertEqual(state["packageVersion"], "0.1.1-beta.8")
+        self.assertEqual(state["sourceRevision"], "package:0.1.1-beta.8")
         self.assertNotIn("sourceRoot", state)
         self.assertEqual(state["payloadRoot"], str(self.source.resolve()))
 
@@ -825,8 +991,256 @@ class SuiteLifecycleTests(unittest.TestCase):
         package_state = load_install_state(self.paths, suite)
         self.assertEqual(package_state["installOrigin"], "package")
         self.assertEqual(package_state["packageName"], "shibumi-shell")
-        self.assertEqual(package_state["packageVersion"], "0.1.1-beta.7")
+        self.assertEqual(package_state["packageVersion"], "0.1.1-beta.8")
         self.assertNotIn("sourceRoot", package_state)
+
+    def test_sandbox_update_advances_beta_7_to_beta_8(self) -> None:
+        beta7_source = self.root / "beta7-source"
+        beta7_source.mkdir()
+        archive = subprocess.run(
+            [
+                "git",
+                "archive",
+                "--format=tar",
+                "v0.1.1-beta.7",
+                "contracts/plugin-suite-v1.json",
+                *self.suite.plugins.keys(),
+            ],
+            cwd=REPO_ROOT,
+            check=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as stream:
+            stream.extractall(beta7_source, filter="data")
+        beta7_suite = Suite.load(beta7_source)
+        control_id = "hancore.shibumi.control-center"
+        self.assertEqual(beta7_suite.version, "0.1.1-beta.7")
+        self.assertNotIn("service", beta7_suite.plugins[control_id].kinds)
+        self.assertIn("service", self.suite.plugins[control_id].kinds)
+        self.assertNotEqual(
+            beta7_suite.plugins[control_id].payload_digest(),
+            self.suite.plugins[control_id].payload_digest(),
+        )
+
+        self.assertEqual(
+            command_install(self.args(), beta7_suite, self.paths, self.runtime),
+            0,
+        )
+        config = json.loads(
+            self.paths.config_file.read_text(encoding="utf-8")
+        )
+        config["bar"].setdefault("shibumi", {})["layoutProtection"] = {
+            "v1": True,
+            "v2": False,
+        }
+        atomic_write(self.paths.config_file, encode_config(config))
+        state_before = self.managed_state_snapshot()
+        activity_before = self.runtime_activity_snapshot()
+        self.assertEqual(self.hidden_transaction_paths(), [])
+
+        self.assertEqual(
+            command_update(
+                self.args(dry_run=True),
+                self.suite,
+                self.paths,
+                self.runtime,
+            ),
+            0,
+        )
+        self.assertEqual(self.managed_state_snapshot(), state_before)
+        self.assertEqual(self.runtime_activity_snapshot(), activity_before)
+        self.assertEqual(self.hidden_transaction_paths(), [])
+
+        self.assertEqual(
+            command_update(self.args(), self.suite, self.paths, self.runtime),
+            0,
+        )
+        updated = load_install_state(self.paths, self.suite)
+        updated_config = json.loads(
+            self.paths.config_file.read_text(encoding="utf-8")
+        )
+        expected_digests = {
+            plugin_id: spec.payload_digest()
+            for plugin_id, spec in self.suite.plugins.items()
+        }
+        self.assertEqual(updated["suiteVersion"], "0.1.1-beta.8")
+        self.assertEqual(updated["sourceRoot"], str(self.source.resolve()))
+        self.assertEqual(updated["pluginDigests"], expected_digests)
+        self.assertEqual(len(updated["plugins"]), 24)
+        self.assertEqual(
+            updated_config["bar"]["shibumi"]["layoutProtection"],
+            {"v1": True, "v2": False},
+        )
+        control_plugin = self.runtime.list_plugins()[control_id]
+        self.assertTrue(control_plugin["enabled"])
+        self.assertIn("service", control_plugin["kinds"])
+        self.assertEqual(self.hidden_transaction_paths(), [])
+        for plugin_id in updated["plugins"]:
+            manifest = json.loads(
+                (self.paths.plugin_dir / plugin_id / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["version"], "0.1.1-beta.8")
+
+    def test_locked_update_discards_staging_without_live_reconciliation(self) -> None:
+        self.install()
+        source_file = self.source / "hancore.shibumi.center" / "BarWidget.qml"
+        source_file.write_text(
+            source_file.read_text(encoding="utf-8")
+            + "\n// update blocked by active lock\n",
+            encoding="utf-8",
+        )
+        self.suite = Suite.load(self.source)
+        state_before = self.managed_state_snapshot()
+        activity_before = self.runtime_activity_snapshot()
+        preflights_before = self.runtime.session_lock_preflights
+        self.runtime.session_lock_status["pending"] = True
+        original_preflight = self.runtime.require_session_unlocked
+        staged_plugin_ids: set[str] = set()
+
+        def reject_locked_update(operation: str) -> None:
+            nonlocal staged_plugin_ids
+            staged_plugin_ids = {
+                str(json.loads(
+                    (path / "manifest.json").read_text(encoding="utf-8")
+                )["id"])
+                for path in self.paths.plugin_dir.glob(".shibumi-stage.*")
+                if path.is_dir()
+            }
+            original_preflight(operation)
+
+        with patch.object(
+            self.runtime,
+            "require_session_unlocked",
+            side_effect=reject_locked_update,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeFailure,
+                r"session lock is active \(pending\)",
+            ):
+                command_update(self.args(), self.suite, self.paths, self.runtime)
+
+        self.assertEqual(staged_plugin_ids, set(self.suite.plugins))
+        self.assertEqual(self.managed_state_snapshot(), state_before)
+        self.assertEqual(self.runtime_activity_snapshot(), activity_before)
+        self.assertEqual(
+            self.runtime.session_lock_preflights, preflights_before + 1
+        )
+
+    def test_interrupted_locked_update_recovers_without_live_reconciliation(
+        self,
+    ) -> None:
+        self.install()
+        state_before = self.managed_state_snapshot()
+        activity_before = self.runtime_activity_snapshot()
+        self.runtime.session_lock_status["secure"] = True
+
+        with patch.object(
+            PluginTransaction,
+            "_cleanup_transaction",
+            side_effect=OSError("injected interrupted pre-exposure cleanup"),
+        ):
+            with self.assertRaisesRegex(
+                OSError,
+                "injected interrupted pre-exposure cleanup",
+            ):
+                command_update(self.args(), self.suite, self.paths, self.runtime)
+
+        journals = list(
+            (self.paths.state_dir / "transactions").glob("*/journal.json")
+        )
+        self.assertEqual(len(journals), 1)
+        journal = json.loads(journals[0].read_text(encoding="utf-8"))
+        self.assertEqual(journal["phase"], "recovery-required")
+        self.assertIs(journal["liveMutationStarted"], False)
+        self.assertTrue(self.hidden_transaction_paths())
+
+        self.assertEqual(recover_transactions(self.paths, self.runtime), 1)
+
+        self.assertEqual(self.managed_state_snapshot(), state_before)
+        self.assertEqual(self.runtime_activity_snapshot(), activity_before)
+
+    def test_failed_stop_intent_write_never_drains_shell(self) -> None:
+        self.install()
+        transaction = PluginTransaction(
+            self.paths,
+            self.runtime,
+            restart_on_reconcile=True,
+        )
+        original_write = transaction._write_journal
+        stops_before = self.runtime.stops
+
+        def fail_stop_intent(
+            phase: str,
+            desired_state: object = "unchanged",
+            archive_previous: object = "unchanged",
+        ) -> None:
+            if phase == "stopping-shell":
+                raise OSError("injected stopping-shell journal failure")
+            original_write(phase, desired_state, archive_previous)
+
+        with patch.object(
+            transaction, "_write_journal", side_effect=fail_stop_intent
+        ):
+            with self.assertRaisesRegex(
+                OSError, "injected stopping-shell journal failure"
+            ):
+                with transaction:
+                    transaction.stop_shell()
+
+        self.assertEqual(self.runtime.stops, stops_before)
+        self.assertTrue(self.runtime.shell_running)
+        self.assertFalse(transaction.transaction_dir.exists())
+        self.assertFalse(self.hidden_transaction_paths())
+
+    def test_shell_stop_intent_is_durable_before_runtime_drain(self) -> None:
+        self.install()
+        state_before = self.managed_state_snapshot()
+        activity_before = self.runtime_activity_snapshot()
+        transaction = PluginTransaction(
+            self.paths,
+            self.runtime,
+            restart_on_reconcile=True,
+        )
+        observed_journal: dict[str, object] = {}
+
+        def interrupted_stop() -> None:
+            nonlocal observed_journal
+            observed_journal = json.loads(
+                transaction.journal_file.read_text(encoding="utf-8")
+            )
+            self.runtime.events.append("stop")
+            self.runtime.stops += 1
+            self.runtime.shell_running = False
+            raise RuntimeFailure("injected interruption after shell drain")
+
+        with patch.object(
+            self.runtime,
+            "stop_shell",
+            side_effect=interrupted_stop,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeFailure,
+                "injected interruption after shell drain",
+            ):
+                transaction.stop_shell()
+
+        self.assertEqual(observed_journal["phase"], "stopping-shell")
+        self.assertIs(observed_journal["shellStopped"], True)
+        self.assertIs(observed_journal["liveMutationStarted"], False)
+        self.assertFalse(self.runtime.shell_running)
+
+        self.assertEqual(recover_transactions(self.paths, self.runtime), 1)
+
+        expected_activity = dict(activity_before)
+        expected_activity.update(
+            events=(*activity_before["events"], "stop", "stop", "restart"),
+            restarts=activity_before["restarts"] + 1,
+            stops=activity_before["stops"] + 2,
+        )
+        self.assertEqual(self.managed_state_snapshot(), state_before)
+        self.assertEqual(self.runtime_activity_snapshot(), expected_activity)
 
     def test_update_transactionally_retires_app_menu(self) -> None:
         self.install()
@@ -856,9 +1270,11 @@ class SuiteLifecycleTests(unittest.TestCase):
         plugin_id = "hancore.shibumi.menu"
         state_before = (self.paths.state_dir / "install.json").read_bytes()
         config_before = self.paths.config_file.read_bytes()
-        self.runtime.fail_rescan_calls.add(self.runtime.rescans + 1)
+        self.runtime.fail_restart_count = 1
 
-        with self.assertRaisesRegex(RuntimeFailure, "injected rescan failure"):
+        with self.assertRaisesRegex(
+            RuntimeFailure, "injected shell restart failure"
+        ):
             command_update(self.args(), self.suite, self.paths, self.runtime)
 
         self.assertTrue((self.paths.plugin_dir / plugin_id).is_dir())
@@ -873,7 +1289,7 @@ class SuiteLifecycleTests(unittest.TestCase):
         for operation in (command_update, command_repair):
             with self.subTest(operation=operation.__name__):
                 state = json.loads(state_path.read_text(encoding="utf-8"))
-                state["suiteVersion"] = "0.1.1-beta.7+installed.7"
+                state["suiteVersion"] = "0.1.1-beta.8+installed.8"
                 state_path.write_text(
                     json.dumps(state, indent=2) + "\n", encoding="utf-8"
                 )
@@ -882,7 +1298,7 @@ class SuiteLifecycleTests(unittest.TestCase):
                     0,
                 )
                 updated = json.loads(state_path.read_text(encoding="utf-8"))
-                self.assertEqual(updated["suiteVersion"], "0.1.1-beta.7")
+                self.assertEqual(updated["suiteVersion"], "0.1.1-beta.8")
 
         self.assertEqual(
             version_key("1.0.0+build.7"),
@@ -945,9 +1361,9 @@ class SuiteLifecycleTests(unittest.TestCase):
         )
 
         rolled_back = load_install_state(self.paths, suite)
-        self.assertEqual(rolled_back["suiteVersion"], "0.1.1-beta.7")
-        self.assertEqual(rolled_back["packageVersion"], "0.1.1-beta.7")
-        self.assertEqual(rolled_back["sourceRevision"], "package:0.1.1-beta.7")
+        self.assertEqual(rolled_back["suiteVersion"], "0.1.1-beta.8")
+        self.assertEqual(rolled_back["packageVersion"], "0.1.1-beta.8")
+        self.assertEqual(rolled_back["sourceRevision"], "package:0.1.1-beta.8")
 
     def test_rescan_uses_shell_ipc_contract(self) -> None:
         runtime = OmarchyRuntime()
@@ -1015,6 +1431,171 @@ class SuiteLifecycleTests(unittest.TestCase):
         self.assertEqual(self.runtime.reloads, reloads_before)
         self.assertEqual(self.runtime.restarts, restarts_before + 3)
         self.assertEqual(self.runtime.stops, stops_before + 3)
+
+    def test_lifecycle_preserves_enabled_stock_bar_transparency(self) -> None:
+        base = json.loads(self.defaults.read_text(encoding="utf-8"))
+        base["bar"]["transparent"] = True
+        atomic_write(self.paths.config_file, encode_config(base))
+
+        self.install()
+        installed = json.loads(self.paths.config_file.read_text(encoding="utf-8"))
+        self.assertIs(installed["bar"]["transparent"], True)
+        self.assertIs(
+            load_install_state(self.paths, self.suite)["previousBar"]["transparent"],
+            True,
+        )
+
+        self.assertEqual(
+            command_update(self.args(), self.suite, self.paths, self.runtime), 0
+        )
+        updated = json.loads(self.paths.config_file.read_text(encoding="utf-8"))
+        self.assertIs(updated["bar"]["transparent"], True)
+
+        self.assertEqual(
+            command_repair(self.args(), self.suite, self.paths, self.runtime), 0
+        )
+        repaired = json.loads(self.paths.config_file.read_text(encoding="utf-8"))
+        self.assertIs(repaired["bar"]["transparent"], True)
+
+        self.assertEqual(
+            command_deactivate(self.args(), self.suite, self.paths, self.runtime),
+            0,
+        )
+        inactive = json.loads(self.paths.config_file.read_text(encoding="utf-8"))
+        self.assertEqual(inactive["bar"].get("id", "omarchy.bar"), "omarchy.bar")
+        self.assertIs(inactive["bar"]["transparent"], True)
+
+        self.assertEqual(
+            command_activate(self.args(), self.suite, self.paths, self.runtime), 0
+        )
+        active = json.loads(self.paths.config_file.read_text(encoding="utf-8"))
+        self.assertEqual(active["bar"]["id"], "hancore.shibumi.bar")
+        self.assertIs(active["bar"]["transparent"], True)
+
+    def test_deactivate_uses_current_stock_bar_transparency_preference(
+        self,
+    ) -> None:
+        base = json.loads(self.defaults.read_text(encoding="utf-8"))
+        base["bar"]["transparent"] = True
+        atomic_write(self.paths.config_file, encode_config(base))
+        self.install()
+
+        absent = object()
+        for index, preference in enumerate((False, True, absent)):
+            current = json.loads(
+                self.paths.config_file.read_text(encoding="utf-8")
+            )
+            if preference is absent:
+                current["bar"].pop("transparent", None)
+            else:
+                current["bar"]["transparent"] = preference
+            atomic_write(self.paths.config_file, encode_config(current))
+
+            self.assertEqual(
+                command_deactivate(
+                    self.args(), self.suite, self.paths, self.runtime
+                ),
+                0,
+            )
+            inactive = json.loads(
+                self.paths.config_file.read_text(encoding="utf-8")
+            )
+            if preference is absent:
+                self.assertNotIn("transparent", inactive["bar"])
+            else:
+                self.assertIs(inactive["bar"]["transparent"], preference)
+
+            if index < 2:
+                self.assertEqual(
+                    command_activate(
+                        self.args(), self.suite, self.paths, self.runtime
+                    ),
+                    0,
+                )
+
+    def test_deactivate_preserves_true_over_false_transparency_snapshot(
+        self,
+    ) -> None:
+        base = json.loads(self.defaults.read_text(encoding="utf-8"))
+        base["bar"]["transparent"] = False
+        atomic_write(self.paths.config_file, encode_config(base))
+        self.install()
+
+        current = json.loads(self.paths.config_file.read_text(encoding="utf-8"))
+        current["bar"]["transparent"] = True
+        atomic_write(self.paths.config_file, encode_config(current))
+
+        self.assertEqual(
+            command_deactivate(self.args(), self.suite, self.paths, self.runtime),
+            0,
+        )
+        inactive = json.loads(self.paths.config_file.read_text(encoding="utf-8"))
+        self.assertIs(inactive["bar"]["transparent"], True)
+
+    def test_uninstall_uses_current_stock_bar_transparency_preference(
+        self,
+    ) -> None:
+        absent = object()
+        for snapshot, preference in (
+            (True, False),
+            (False, True),
+            (True, absent),
+        ):
+            base = json.loads(self.defaults.read_text(encoding="utf-8"))
+            base["bar"]["transparent"] = snapshot
+            atomic_write(self.paths.config_file, encode_config(base))
+            self.install()
+
+            current = json.loads(
+                self.paths.config_file.read_text(encoding="utf-8")
+            )
+            if preference is absent:
+                current["bar"].pop("transparent", None)
+            else:
+                current["bar"]["transparent"] = preference
+            atomic_write(self.paths.config_file, encode_config(current))
+
+            self.assertEqual(
+                command_uninstall(
+                    self.args(), self.suite, self.paths, self.runtime
+                ),
+                0,
+            )
+            uninstalled = json.loads(
+                self.paths.config_file.read_text(encoding="utf-8")
+            )
+            if preference is absent:
+                self.assertNotIn("transparent", uninstalled["bar"])
+            else:
+                self.assertIs(uninstalled["bar"]["transparent"], preference)
+
+    def test_lifecycle_preserves_disabled_stock_bar_transparency(self) -> None:
+        base = json.loads(self.defaults.read_text(encoding="utf-8"))
+        base["bar"]["transparent"] = False
+        atomic_write(self.paths.config_file, encode_config(base))
+
+        self.install()
+        for operation in (
+            lambda: command_update(
+                self.args(), self.suite, self.paths, self.runtime
+            ),
+            lambda: command_repair(
+                self.args(), self.suite, self.paths, self.runtime
+            ),
+            lambda: command_deactivate(
+                self.args(), self.suite, self.paths, self.runtime
+            ),
+            lambda: command_activate(
+                self.args(), self.suite, self.paths, self.runtime
+            ),
+        ):
+            current = json.loads(
+                self.paths.config_file.read_text(encoding="utf-8")
+            )
+            self.assertIs(current["bar"]["transparent"], False)
+            self.assertEqual(operation(), 0)
+        current = json.loads(self.paths.config_file.read_text(encoding="utf-8"))
+        self.assertIs(current["bar"]["transparent"], False)
 
     def test_activate_after_deactivate_keeps_host_layouts_separate(self) -> None:
         self.install()
@@ -1095,9 +1676,45 @@ class SuiteLifecycleTests(unittest.TestCase):
             any(plugin_id.startswith("omarchy.") for plugin_id in layout_ids)
         )
 
+    def test_migration_does_not_create_transparency_preference(self) -> None:
+        self.prepare_legacy_install()
+        config = json.loads(self.paths.config_file.read_text(encoding="utf-8"))
+        self.assertNotIn("transparent", config["bar"])
+        defaults = json.loads(self.defaults.read_text(encoding="utf-8"))
+        defaults["bar"]["transparent"] = False
+        self.defaults.write_text(
+            json.dumps(defaults, indent=2) + "\n", encoding="utf-8"
+        )
+
+        self.assertEqual(
+            command_migrate(self.args(), self.suite, self.paths, self.runtime), 0
+        )
+
+        migrated = json.loads(self.paths.config_file.read_text(encoding="utf-8"))
+        state = load_install_state(self.paths, self.suite)
+        self.assertNotIn("transparent", migrated["bar"])
+        self.assertNotIn("transparent", state["previousBar"])
+
+    def test_migration_preserves_false_transparency_preference(self) -> None:
+        self.prepare_legacy_install()
+        config = json.loads(self.paths.config_file.read_text(encoding="utf-8"))
+        config["bar"]["transparent"] = False
+        atomic_write(self.paths.config_file, encode_config(config))
+
+        self.assertEqual(
+            command_migrate(self.args(), self.suite, self.paths, self.runtime), 0
+        )
+
+        migrated = json.loads(self.paths.config_file.read_text(encoding="utf-8"))
+        state = load_install_state(self.paths, self.suite)
+        self.assertIs(migrated["bar"]["transparent"], False)
+        self.assertIs(state["previousBar"]["transparent"], False)
+
     def test_migrate_preserves_settings_and_retires_legacy_namespace(self) -> None:
         legacy_state = self.prepare_legacy_install()
         legacy_config = json.loads(self.paths.config_file.read_text(encoding="utf-8"))
+        legacy_config["bar"]["transparent"] = True
+        atomic_write(self.paths.config_file, encode_config(legacy_config))
         expected_left = [
             entry_id(entry).replace("hancore.qsrise", "hancore.shibumi", 1)
             for entry in legacy_config["bar"]["layout"]["left"]
@@ -1111,6 +1728,7 @@ class SuiteLifecycleTests(unittest.TestCase):
         self.assertEqual(config["bar"]["id"], "hancore.shibumi.bar")
         self.assertEqual(config["bar"]["centerAnchor"], "hancore.shibumi.center")
         self.assertEqual(config["bar"]["style"], "shibumi")
+        self.assertIs(config["bar"]["transparent"], True)
         self.assertNotIn("qsrise", config["bar"])
         settings = config["bar"]["shibumi"]
         self.assertEqual(settings["iconSize"], 17)
@@ -1142,6 +1760,7 @@ class SuiteLifecycleTests(unittest.TestCase):
             new_state["migratedFrom"]["sourceRevision"],
             legacy_state["sourceRevision"],
         )
+        self.assertIs(new_state["previousBar"]["transparent"], True)
         for new_id in self.suite.plugins:
             old_id = new_id.replace("hancore.shibumi", "hancore.qsrise", 1)
             self.assertTrue((self.paths.plugin_dir / new_id).is_dir())
@@ -1618,6 +2237,32 @@ class SuiteLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(command_status(self.suite, self.paths), 0)
 
+    def test_managed_update_stops_before_publish_and_restarts_once(self) -> None:
+        self.install()
+        original_expose = PluginTransaction.expose
+
+        def recording_expose(transaction: PluginTransaction) -> None:
+            self.runtime.events.append("expose")
+            original_expose(transaction)
+
+        self.runtime.events.clear()
+        with patch.object(PluginTransaction, "expose", recording_expose):
+            self.assertEqual(
+                command_update(self.args(), self.suite, self.paths, self.runtime),
+                0,
+            )
+
+        self.assertIn("stop", self.runtime.events)
+        self.assertIn("expose", self.runtime.events)
+        self.assertLess(
+            self.runtime.events.index("stop"), self.runtime.events.index("expose")
+        )
+        self.assertEqual(self.runtime.events.count("restart"), 1)
+        self.assertNotIn("rescan", self.runtime.events)
+        self.assertNotIn("reload-config", self.runtime.events)
+        self.assertNotIn("reload-payload", self.runtime.events)
+        self.assertEqual(command_status(self.suite, self.paths), 0)
+
     def test_managed_repair_stops_before_publish_and_restarts_once(self) -> None:
         self.install()
         plugin_id = "hancore.shibumi.bluetooth"
@@ -1710,7 +2355,7 @@ class SuiteLifecycleTests(unittest.TestCase):
         )
         self.assertFalse(self.hidden_transaction_paths())
 
-    def test_started_repair_uses_live_fallback_when_rollback_restart_is_blocked(self) -> None:
+    def test_started_repair_retains_recovery_when_rollback_restart_is_blocked(self) -> None:
         self.install()
         original_config = self.paths.config_file.read_bytes()
         original_state = (self.paths.state_dir / "install.json").read_bytes()
@@ -1733,17 +2378,26 @@ class SuiteLifecycleTests(unittest.TestCase):
             side_effect=RuntimeFailure("injected post-restart verification failure"),
         ):
             with self.assertRaisesRegex(
-                RuntimeFailure, "injected post-restart verification failure"
+                RuntimeFailure, "injected rollback restart preflight failure"
             ):
                 command_repair(self.args(), self.suite, self.paths, self.runtime)
 
         self.assertEqual(restart_calls, 2)
-        self.assertTrue(self.runtime.shell_running)
-        self.assertGreater(self.runtime.reloads, reloads_before)
+        self.assertFalse(self.runtime.shell_running)
+        self.assertEqual(self.runtime.reloads, reloads_before)
         self.assertEqual(self.paths.config_file.read_bytes(), original_config)
         self.assertEqual(
             (self.paths.state_dir / "install.json").read_bytes(), original_state
         )
+        self.assertEqual(
+            len(list(
+                (self.paths.state_dir / "transactions").glob("*/journal.json")
+            )),
+            1,
+        )
+
+        self.assertEqual(recover_transactions(self.paths, self.runtime), 1)
+        self.assertTrue(self.runtime.shell_running)
         self.assertFalse(self.hidden_transaction_paths())
 
     def test_stopped_repair_retains_recovery_when_restart_remains_blocked(self) -> None:
@@ -1932,9 +2586,10 @@ class SuiteLifecycleTests(unittest.TestCase):
         self.suite = Suite.load(self.source)
         stops_before = self.runtime.stops
         reloads_before = self.runtime.payload_reloads
-        # The operational restart and rollback restart both fail their host
-        # preflight before killing the still-running shell.
-        self.runtime.fail_restart_count = 2
+        restarts_before = self.runtime.restarts
+        # Publishing occurs only after a controlled drain. If the operational
+        # start fails, rollback restores the old bytes and starts them once.
+        self.runtime.fail_restart_count = 1
         with self.assertRaisesRegex(
             RuntimeFailure, "injected shell restart failure"
         ):
@@ -1942,10 +2597,101 @@ class SuiteLifecycleTests(unittest.TestCase):
         self.assertEqual(target_file.read_bytes(), old_payload)
         self.assertEqual(self.paths.config_file.read_bytes(), old_config)
         self.assertEqual((self.paths.state_dir / "install.json").read_bytes(), old_state)
-        self.assertEqual(self.runtime.stops, stops_before)
-        self.assertGreater(self.runtime.payload_reloads, reloads_before)
+        self.assertEqual(self.runtime.stops, stops_before + 2)
+        self.assertEqual(self.runtime.restarts, restarts_before + 2)
+        self.assertEqual(self.runtime.payload_reloads, reloads_before)
         self.assertFalse(self.hidden_transaction_paths())
         self.assertFalse((self.paths.state_dir / "transactions").exists())
+
+    def test_update_rollback_drains_a_shell_started_before_timeout(self) -> None:
+        self.install()
+        source_file = (
+            self.source / "hancore.shibumi.center" / "BarWidget.qml"
+        )
+        source_file.write_text(
+            source_file.read_text(encoding="utf-8")
+            + "\n// post-launch rollback fixture\n",
+            encoding="utf-8",
+        )
+        self.suite = Suite.load(self.source)
+        original_restore = transaction_module._restore_records
+        restart_calls = 0
+
+        def start_then_report() -> None:
+            nonlocal restart_calls
+            restart_calls += 1
+            self.runtime.events.append("restart")
+            self.runtime.restarts += 1
+            self.runtime.shell_running = True
+            if restart_calls == 1:
+                raise RuntimeFailure("injected post-launch timeout")
+
+        def recording_restore(*args: object) -> None:
+            self.runtime.events.append("restore")
+            self.assertFalse(
+                self.runtime.shell_running,
+                "rollback restored plugin roots while the shell was running",
+            )
+            original_restore(*args)
+
+        self.runtime.events.clear()
+        with patch.object(
+            self.runtime, "restart_shell", side_effect=start_then_report
+        ), patch.object(
+            transaction_module, "_restore_records", side_effect=recording_restore
+        ):
+            with self.assertRaisesRegex(
+                RuntimeFailure, "injected post-launch timeout"
+            ):
+                command_update(self.args(), self.suite, self.paths, self.runtime)
+
+        self.assertEqual(restart_calls, 2)
+        self.assertEqual(self.runtime.events.count("stop"), 2)
+        self.assertLess(
+            [
+                index
+                for index, event in enumerate(self.runtime.events)
+                if event == "stop"
+            ][1],
+            self.runtime.events.index("restore"),
+        )
+        self.assertTrue(self.runtime.shell_running)
+        self.assertFalse(self.hidden_transaction_paths())
+
+    def test_update_verification_failure_drains_before_live_restore(self) -> None:
+        self.install()
+        plugin_id = "hancore.shibumi.center"
+        target_file = self.paths.plugin_dir / plugin_id / "BarWidget.qml"
+        source_file = self.source / plugin_id / "BarWidget.qml"
+        old_payload = target_file.read_bytes()
+        old_state = (self.paths.state_dir / "install.json").read_bytes()
+        source_file.write_text(
+            source_file.read_text(encoding="utf-8")
+            + "\n// verification rollback fixture\n",
+            encoding="utf-8",
+        )
+        self.suite = Suite.load(self.source)
+        self.runtime.events.clear()
+
+        with patch.object(
+            self.runtime,
+            "verify_update",
+            side_effect=RuntimeFailure("injected update verification failure"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeFailure, "injected update verification failure"
+            ):
+                command_update(self.args(), self.suite, self.paths, self.runtime)
+
+        self.assertEqual(
+            self.runtime.events, ["stop", "restart", "stop", "restart"]
+        )
+        self.assertEqual(target_file.read_bytes(), old_payload)
+        self.assertEqual(
+            (self.paths.state_dir / "install.json").read_bytes(), old_state
+        )
+        self.assertTrue(self.runtime.shell_running)
+        self.assertFalse(self.hidden_transaction_paths())
 
     def test_update_adds_new_profile_plugin_without_rewriting_user_layout(self) -> None:
         self.install()
@@ -2220,6 +2966,11 @@ class SuiteLifecycleTests(unittest.TestCase):
             for index, event in enumerate(events)
             if event[0] == "journal:staged"
         )
+        exposing_journal = next(
+            index
+            for index, event in enumerate(events)
+            if event[0] == "journal:exposing"
+        )
         exposure_index = next(
             index for index, event in enumerate(events) if event[0] == "exposure"
         )
@@ -2237,7 +2988,8 @@ class SuiteLifecycleTests(unittest.TestCase):
         self.assertLess(durable_plugin_directory, tree_index)
         self.assertLess(tree_index, durable_stage_entry)
         self.assertLess(durable_stage_entry, staged_journal)
-        self.assertLess(staged_journal, exposure_index)
+        self.assertLess(staged_journal, exposing_journal)
+        self.assertLess(exposing_journal, exposure_index)
         self.assertLess(exposure_index, durable_exposure)
         self.assertLess(durable_exposure, exposed_journal)
         transaction.rollback()
@@ -2366,6 +3118,8 @@ class SuiteLifecycleTests(unittest.TestCase):
             "missing snapshot",
             "malformed second record",
             "invalid late boolean",
+            "invalid live mutation boolean",
+            "inconsistent pre-exposure phase",
             "boolean schema",
             "float schema",
             "array journal",
@@ -2412,6 +3166,13 @@ class SuiteLifecycleTests(unittest.TestCase):
                 elif scenario == "invalid late boolean":
                     assert isinstance(journal, dict)
                     journal["payloadReloadExpected"] = "false"
+                elif scenario == "invalid live mutation boolean":
+                    assert isinstance(journal, dict)
+                    journal["liveMutationStarted"] = "false"
+                elif scenario == "inconsistent pre-exposure phase":
+                    assert isinstance(journal, dict)
+                    journal["phase"] = "exposed"
+                    journal["liveMutationStarted"] = False
                 elif scenario == "boolean schema":
                     assert isinstance(journal, dict)
                     journal["schemaVersion"] = True
@@ -2603,6 +3364,115 @@ class SuiteLifecycleTests(unittest.TestCase):
                     )
                 self.assertFalse(self.hidden_transaction_paths())
 
+    def test_shell_started_recovery_drains_before_restoring_payload(self) -> None:
+        self.install()
+        plugin_id = "hancore.shibumi.memory"
+        target_file = self.paths.plugin_dir / plugin_id / "BarWidget.qml"
+        old_payload = target_file.read_bytes()
+        old_config = self.paths.config_file.read_bytes()
+        source_file = self.source / plugin_id / "BarWidget.qml"
+        source_file.write_text(
+            source_file.read_text(encoding="utf-8")
+            + "\n// shell-started recovery fixture\n",
+            encoding="utf-8",
+        )
+        suite = Suite.load(self.source)
+        transaction = PluginTransaction(
+            self.paths, self.runtime, restart_on_reconcile=True
+        )
+        transaction.stage(
+            (suite.plugins[plugin_id],),
+            revision="shell-started",
+            suite_version=suite.version,
+        )
+        transaction.stop_shell()
+        transaction.expose()
+        transaction.write_config(b'{"version":1,"bar":{"id":"broken"}}\n')
+        self.runtime.restart_shell()
+        transaction.mark_shell_started()
+        journal = json.loads(
+            transaction.journal_file.read_text(encoding="utf-8")
+        )
+        self.assertIs(journal["shellStopped"], False)
+        self.assertIs(journal["restoreRequiresDrain"], True)
+        stops_before = self.runtime.stops
+
+        self.assertEqual(recover_transactions(self.paths, self.runtime), 1)
+
+        self.assertEqual(self.runtime.stops, stops_before + 1)
+        self.assertEqual(target_file.read_bytes(), old_payload)
+        self.assertEqual(self.paths.config_file.read_bytes(), old_config)
+        self.assertTrue(self.runtime.shell_running)
+        self.assertFalse(self.hidden_transaction_paths())
+
+    def test_recovery_rejects_external_target_before_stopping_shell(self) -> None:
+        self.install()
+        plugin_id = "hancore.shibumi.memory"
+        transaction = PluginTransaction(
+            self.paths, self.runtime, restart_on_reconcile=True
+        )
+        transaction.stage(
+            (self.suite.plugins[plugin_id],),
+            revision="external-target",
+            suite_version=self.suite.version,
+        )
+        transaction.stop_shell()
+        transaction.expose()
+        self.runtime.restart_shell()
+
+        target = self.paths.plugin_dir / plugin_id
+        shutil.rmtree(target)
+        target.mkdir()
+        (target / "external.txt").write_text("foreign\n", encoding="utf-8")
+        stops_before = self.runtime.stops
+
+        with self.assertRaisesRegex(
+            TransactionError, "externally changed target"
+        ):
+            recover_transactions(self.paths, self.runtime)
+
+        self.assertEqual(self.runtime.stops, stops_before)
+        self.assertTrue(self.runtime.shell_running)
+        self.assertTrue(transaction.transaction_dir.is_dir())
+        self.assertEqual(
+            (target / "external.txt").read_text(encoding="utf-8"), "foreign\n"
+        )
+
+    def test_recovery_rejects_external_new_target_before_stopping_shell(self) -> None:
+        self.install()
+        plugin_id = "hancore.shibumi.memory"
+        target = self.paths.plugin_dir / plugin_id
+        shutil.rmtree(target)
+        transaction = PluginTransaction(
+            self.paths, self.runtime, restart_on_reconcile=True
+        )
+        transaction.stage(
+            (self.suite.plugins[plugin_id],),
+            revision="external-new-target",
+            suite_version=self.suite.version,
+        )
+        self.assertIs(transaction.records[0]["hadTarget"], False)
+        transaction.stop_shell()
+        transaction.expose()
+        self.runtime.restart_shell()
+
+        shutil.rmtree(target)
+        target.mkdir()
+        (target / "external.txt").write_text("foreign\n", encoding="utf-8")
+        stops_before = self.runtime.stops
+
+        with self.assertRaisesRegex(
+            TransactionError, "externally changed target"
+        ):
+            recover_transactions(self.paths, self.runtime)
+
+        self.assertEqual(self.runtime.stops, stops_before)
+        self.assertTrue(self.runtime.shell_running)
+        self.assertTrue(transaction.transaction_dir.is_dir())
+        self.assertEqual(
+            (target / "external.txt").read_text(encoding="utf-8"), "foreign\n"
+        )
+
     def test_legacy_journal_without_shell_state_requires_restart(self) -> None:
         self.install()
         plugin_id = "hancore.shibumi.memory"
@@ -2617,6 +3487,7 @@ class SuiteLifecycleTests(unittest.TestCase):
         transaction.write_config(b'{"version":1,"bar":{"id":"broken"}}\n')
         journal = json.loads(transaction.journal_file.read_text(encoding="utf-8"))
         journal.pop("shellStopped")
+        journal.pop("restoreRequiresDrain")
         transaction.journal_file.write_text(
             json.dumps(journal, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",

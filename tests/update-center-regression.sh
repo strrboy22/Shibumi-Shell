@@ -90,8 +90,17 @@ if rg -n '(^|[^A-Za-z])(pacman|paru|yay)([^A-Za-z]|$)' \
     --glob '*.qml' --glob '*.js' "$plugin" >/dev/null; then
   fail 'update-center QML invokes a package manager directly'
 fi
-rg -q 'root\.updateService\.launchPackageUpdate\(\)' "$packages" \
-  || fail 'package tab bypasses the service action boundary'
+for package_update_contract in \
+    'function openSystemUpdater()' \
+    'updateService.launchPackageUpdate()' \
+    'typeof panel.ownerWidget.close === "function"' \
+    'panel.ownerWidget.close()' \
+    'objectName: "packageFooterRefresh"' \
+    'objectName: "packageFooterSystemUpdate"' \
+    'onClicked: root.openSystemUpdater()'; do
+  rg -Fq "$package_update_contract" "$packages" \
+    || fail "system update close contract drifted: $package_update_contract"
+done
 rg -q 'OMARCHY_THEME_UPDATE_STATE=' "$service" \
   || fail 'theme check/apply does not share pinned state'
 rg -q 'bash", themeApplyScript, name, target' "$service" \
@@ -100,16 +109,59 @@ rg -q 'bash", themeApplyScript, "--all"' "$service" \
   || fail 'bulk theme apply does not use the pinned apply helper'
 rg -q 'themeReviewScript' "$service" \
   || fail 'theme review does not use the pinned review helper'
-rg -q 'viewThemeChanges\(modelData\)' "$themes" \
-  || fail 'theme table does not expose the reviewed change view'
+for theme_review_close_contract in \
+    'function openThemeReview(theme)' \
+    'if (!updateService.viewThemeChanges(theme)) return false' \
+    'typeof panel.ownerWidget.close === "function"' \
+    'panel.ownerWidget.close()'; do
+  rg -Fq "$theme_review_close_contract" "$themes" \
+    || fail "theme review close contract drifted: $theme_review_close_contract"
+done
+theme_review_triggers=$(rg -c -F \
+  'onClicked: root.openThemeReview(modelData)' "$themes")
+[[ $theme_review_triggers -eq 2 ]] \
+  || fail 'both theme review triggers must share the close-aware action'
 if sed -n '/text: root\.updateService\.themeRefreshing ? "Checking…" : "Check themes"/,/onClicked: root\.updateService\.refreshThemes()/p' \
     "$themes" | rg -q 'iconText:'; then
   fail 'check-themes text action still includes an icon'
 fi
 if sed -n '/text: root\.updateService\.currentThemeNeedsReapply/,/onClicked: root\.updateService\.reapplyCurrentTheme()/p' \
     "$themes" | rg -q 'iconText:'; then
-  fail 'reapply text action still includes an icon'
+  fail 'Re-Apply text action still includes an icon'
 fi
+for theme_footer_contract in \
+    'return "re-applying"' \
+    '? "Re-Apply the active theme below"' \
+    'objectName: "themeFooterActions"' \
+    'objectName: "themeFooterReapply"' \
+    'objectName: "themeFooterCheck"' \
+    'objectName: "themeFooterUpdate"' \
+    '? "Re-Apply current" : "Re-Apply"' \
+    'tooltipText: "Re-Apply the active user theme"' \
+    'onClicked: root.updateService.reapplyCurrentTheme()' \
+    'onClicked: root.updateService.refreshThemes()' \
+    'onClicked: root.updateService.updateAllThemes()'; do
+  rg -Fq "$theme_footer_contract" "$themes" \
+    || fail "theme footer action drifted: $theme_footer_contract"
+done
+reapply_action_line=$(rg -n -m1 -F \
+  'onClicked: root.updateService.reapplyCurrentTheme()' "$themes" \
+  | cut -d: -f1)
+check_action_line=$(rg -n -m1 -F \
+  'onClicked: root.updateService.refreshThemes()' "$themes" \
+  | cut -d: -f1)
+update_action_line=$(rg -n -m1 -F \
+  'onClicked: root.updateService.updateAllThemes()' "$themes" \
+  | cut -d: -f1)
+(( reapply_action_line < check_action_line
+    && check_action_line < update_action_line )) \
+  || fail 'theme footer order must be Re-Apply, Check themes, Update clean'
+for reapply_status_contract in \
+    'actionStatus = "Re-Applying " + name + "…"' \
+    'actionStatus = "Re-Applied " + completedName'; do
+  rg -Fq "$reapply_status_contract" "$service" \
+    || fail "Re-Apply status label drifted: $reapply_status_contract"
+done
 [[ -x $review ]] || fail 'theme review helper is not executable'
 if rg -n '(font\.family|fontFamily): root\.bar\.fontFamily' \
     --glob '*.qml' "$plugin" >/dev/null; then

@@ -13,6 +13,15 @@ ShellRoot {
     Qt.exit(1)
   }
 
+  function pillSurface(widget) {
+    const children = widget ? widget.children || [] : []
+    for (const child of children) {
+      if (child && "v1AppearanceEnabled" in child
+          && "tokenSource" in child) return child
+    }
+    return null
+  }
+
   component FakeUpdate: Item {
     property var bar: null
     property string moduleName: ""
@@ -125,6 +134,7 @@ ShellRoot {
     property string fontFamily: "monospace"
     property color foreground: "#eeeeee"
     property color barForeground: foreground
+    property color background: "#101214"
     property color urgent: "#88bbee"
     property bool foregroundAnimationEnabled: false
     property var activePopout: null
@@ -133,6 +143,8 @@ ShellRoot {
     property var clickTargets: root.clickTargets
     property int summonCount: 0
     property var visualTokens: ({
+      shellStyle: "shibumi",
+      v2Shell: false,
       pillHeight: 24,
       pillRadius: 12,
       pillPaddingX: 9,
@@ -156,7 +168,23 @@ ShellRoot {
       fillPrimaryHover: "#9cc9ed",
       sumi: "#777777",
       sumiHi: "#aaaaaa",
-      paper: "#101214"
+      ink: fakeBar.foreground,
+      paper: fakeBar.background,
+      widgetHasFill: function(settings) {
+        return settings && settings.color === "color01"
+      },
+      widgetFillColor: function(settings) {
+        return settings && settings.color === "color01"
+          ? fakeShell.palette01 : "transparent"
+      },
+      widgetSurfaceOpacity: function(settings) {
+        return settings && settings.surfaceOpacity !== undefined
+          ? Number(settings.surfaceOpacity) : 1
+      },
+      widgetContentColor: function(settings, fallback) {
+        return settings && settings.color === "color01"
+          && settings.tone === "background" ? fakeBar.background : fallback
+      }
     })
 
     function widgetSettings(_group, module) {
@@ -187,6 +215,12 @@ ShellRoot {
   Center.BarWidget {
     id: center
     bar: fakeBar
+    settings: ({
+      color: "color01",
+      colorMode: "border",
+      tone: "background",
+      surfaceOpacity: 0.6
+    })
     availableWidth: 500
     calendarSource: Qt.resolvedUrl("CenterTestCalendar.qml")
   }
@@ -207,6 +241,12 @@ ShellRoot {
         if (center.stage !== 0 || center.dateText !== "Thu 16"
             || center.centerService !== secondCenter.centerService
             || center.statusService !== secondCenter.statusService
+            || !Qt.colorEqual(center.widgetInk, fakeBar.background)
+            || !Qt.colorEqual(secondCenter.widgetInk, fakeBar.foreground)
+            || Math.abs(center.dateContentColor.r - fakeBar.background.r) > 0.001
+            || Math.abs(center.dateContentColor.g - fakeBar.background.g) > 0.001
+            || Math.abs(center.dateContentColor.b - fakeBar.background.b) > 0.001
+            || Math.abs(center.dateContentColor.a - 0.5) > 0.001
             || !serviceEntryPoint.clock || !serviceEntryPoint.weather
             || serviceEntryPoint.weather.enabled
             || secondCenter.calendarLoaded
@@ -287,7 +327,12 @@ ShellRoot {
             || center.indicatorWidget.dndIconFamily !== "Material Symbols Rounded"
             || center.indicatorWidget.recordingIconFamily !== center.bar.fontFamily
             || center.indicatorWidget.recordingIconGlyph !== "󰻂"
-            || center.indicatorWidget.recordingIconColor !== fakeShell.palette01
+            || !center.indicatorWidget.customToneActive
+            || secondCenter.indicatorWidget.customToneActive
+            || !Qt.colorEqual(center.indicatorWidget.recordingIconColor,
+              fakeBar.background)
+            || !Qt.colorEqual(secondCenter.indicatorWidget.recordingIconColor,
+              fakeShell.palette01)
             || center.indicatorWidget.voxtypeIconFamily !== "Material Symbols Rounded"
             || !center.indicatorWidget.toggleStayAwake()
             || sharedStatus.stayAwake
@@ -303,9 +348,39 @@ ShellRoot {
         sharedStatus.recording = false
         sharedStatus.voxtypeActive = false
         sharedStatus.voxtypeState = "idle"
+      } else if (root.phase === 5) {
+        const surface = root.pillSurface(center)
+        if (center.stage !== 0 || center.implicitHeight !== 35
+            || !surface || surface.height !== 24
+            || Math.abs(surface.y - 6) > 0.01
+            || !surface.v1CustomFill
+            || surface.renderedSurfaceCount !== 1)
+          return root.fail("V1 center pill geometry"
+            + " root=" + center.implicitHeight
+            + " pill=" + (surface ? surface.height : -1)
+            + " y=" + (surface ? surface.y : -1)
+            + " fill=" + (surface ? surface.v1CustomFill : false))
+        const v2Tokens = ({})
+        for (const key in fakeBar.visualTokens)
+          v2Tokens[key] = fakeBar.visualTokens[key]
+        v2Tokens.shellStyle = "notch"
+        v2Tokens.v2Shell = true
+        fakeBar.visualTokens = v2Tokens
+        fakeBar.barSize = 33
       } else {
-        if (center.stage !== 0 || center.implicitHeight !== 35)
-          return root.fail("normal stage restore/geometry")
+        const surface = root.pillSurface(center)
+        if (center.implicitHeight !== 33
+            || !surface || surface.height !== 24
+            || Math.abs(surface.y - 5) > 0.01
+            || surface.shellPillVisible
+            || surface.renderedSurfaceCount !== 0
+            || !surface.customDecorated)
+          return root.fail("V2 center pill geometry"
+            + " root=" + center.implicitHeight
+            + " pill=" + (surface ? surface.height : -1)
+            + " y=" + (surface ? surface.y : -1)
+            + " shellPill=" + (surface
+              ? surface.shellPillVisible : true))
         stop()
         console.log("center plugin smoke passed")
         Qt.quit()

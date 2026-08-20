@@ -85,6 +85,11 @@ baseline.
   `G9, G10, G11, G14, G12, G13, G15` on the right.
 - All split boundaries start disabled. Split markers, drag targets, invalid
   returns, persistence, and geometry must retain the V1 behavior.
+- V1 and V2 own independent optional layout-protection preferences. Both
+  default off to preserve direct live editing. When protection is enabled for
+  the active generation, direct split, divider, and section-boundary clicks on
+  the bar require that output's explicit edit mode; the Control Center's
+  deliberate bulk and restore actions remain available.
 - G7 AI usage, G14 power profile, and G15 Bluetooth start disabled. Other
   groups start enabled. Hardware-dependent widgets may remain hidden when the
   required hardware is absent.
@@ -282,13 +287,19 @@ barWidgetRegistry
 barConfig
 ```
 
-`barConfig` is host-owned. Shibumi renders it and requests mutations through the
-host API; it must not maintain a competing `shell.json` representation.
+`barConfig` is host-owned. Shibumi consumes supported fields and requests
+mutations through the host API; it must not maintain a competing `shell.json`
+representation. `bar.transparent` is exclusively the saved transparency
+preference of `omarchy.bar`. Shibumi V1 and V2 ignore it, render opaque, expose
+fixed-false compatibility facade values, and never create, remove, or rewrite
+the saved preference.
 
 ### Configuration and reset behavior
 
 - Shibumi owns only its `bar.shibumi` extension inside the host-owned
-  `shell.json` document.
+  `shell.json` document. The sibling `bar.transparent` preference remains
+  stock-bar-owned and survives install, update, activation, deactivation, and
+  migration unchanged.
 - The one-time migration renames `hancore.qsrise.*` IDs, `bar.qsrise`, nested
   plugin-keyed settings, and string references without changing unrelated
   configuration or the user's layout order.
@@ -549,12 +560,12 @@ Current Phase 2 foundation:
   feature data and workers live in independently validated plugins;
 - fail-closed schema-1 parser for V1 group order, splits, and resource-bounded
   widget settings;
-- one root-owned procfs telemetry service shared by every output;
+- one process-wide `hancore.shibumi.telemetry` procfs service shared by every output;
 - internal CPU and memory widgets with compact/full horizontal presentations;
 - screen-local, on-demand CPU and memory panels;
 - GPU telemetry is inactive unless a CPU panel is open and tolerates missing or
   unusable `nvidia-smi` by falling back to DRM sysfs or no GPU row.
-- one root-owned Hyprland workspace model with V1 persist-10, persist-5, active,
+- one process-wide `hancore.shibumi.workspaces` Hyprland model with V1 persist-10, persist-5, active,
   default, numbers, and magic presentation contracts;
 - a validated Quattro workspace action adapter, per-screen Shibumi workspace
   widget, and lifecycle-lazy keyboard panel whose backend-free content is
@@ -562,8 +573,8 @@ Current Phase 2 foundation:
 - the Control Center owns Shibumi settings while Omarchy exclusively owns the
   application launcher menu. Disabled widget loaders and the default-off G7
   service construct no backend work;
-- one root-owned minute-precision clock service and one root-owned weather
-  service feed a single V1-compatible G8 center composite on every output;
+- one process-wide `hancore.shibumi.center` clock and weather service feeds a
+  single V1-compatible G8 center composite on every output;
   the composite owns weather, clock/date/calendar, and active-only status
   presentation while retaining the official weather detail workflow and
   official Omarchy idle/notification state owners;
@@ -603,18 +614,26 @@ Current Phase 2 foundation:
   settings, screen-aware alias routing, action forwarding, unique click
   registration, model release, and teardown. Real Wayland panel mapping remains
   an acceptance gate.
-- G7 replaces the stock multi-chip `omarchy.model-usage` presentation with one
-  selected-provider Shibumi pill and one lazy local panel. A single root-owned
-  `AiUsageService` dynamically loads Quattro's official Claude/Codex provider
-  scanners only when matching local data exists, so missing providers do not
-  poll or emit missing-file errors;
-- OpenCode is supplied by one plugin-local read-only SQLite adapter because
-  Quattro has no OpenCode provider. It runs at activation and every five
-  minutes while OpenCode data exists, writes no cache, makes no network call,
-  and is shared by every output. Provider selection, refresh, legacy
-  `omarchy.model-usage` summon/hide routing, real Wayland panel mapping, and the
-  complete Quattro contract suite are accepted on the validation system. Real Claude/Codex
-  account-data and multi-output acceptance remain gates.
+- G7 replaces the stock AI presentation with one selected-provider Shibumi
+  pill and one lazy local panel. The process-wide `hancore.shibumi.ai` service consumes
+  the primitive schema-v1 records produced by current `omarchy.agents`; it
+  never loads the host Agents panel or exposes host backend objects to views.
+  The service owns one bounded update process and two watched Claude/Codex
+  record paths process-wide while G7 is active; disabled G7/providers own no
+  collector, record watcher, legacy provider, or OpenCode worker. On the
+  pinned older Quattro baselines, the
+  legacy `omarchy.model-usage` providers remain an exclusive fallback;
+- OpenCode is supplied by one plugin-local read-only SQLite adapter because the
+  consumed Agents record set does not publish an OpenCode record. It runs at
+  activation and every five minutes while OpenCode data exists, writes no
+  cache, makes no network call, and is shared by every output. Provider
+  selection, refresh, `omarchy.agents` plus legacy `omarchy.model-usage`
+  summon/hide routing, real Wayland panel mapping, and the complete pinned
+  Quattro contract suite remain the acceptance boundary. Real Claude/Codex
+  account-data on the current Agents host and multi-output acceptance remain
+  gates. The consumed Agents manifest, update command, collectors, and record
+  schema are revision-bound to Omarchy `b99fd91` by a repository-owned
+  compatibility contract rather than inferred from mutable installed files.
 - G9 replaces only the official media presentation. The keep-loaded
   `omarchy.media` service remains the sole MPRIS/PipeWire selection and action
   owner while Shibumi views supply the default row, FULL/muse row, lazy panel,
@@ -630,18 +649,25 @@ Current Phase 2 foundation:
   paths per frame. the validation system accepts the real-player, unavailable/crash,
   retry/cleanup, Top/Bottom, single-output visual, and resource slices.
   Multiple real players and physical multi-output acceptance remain gates.
-- G11 uses one root-owned `NetworkService`, regardless of output count. It
+- G11 uses one process-wide `hancore.shibumi.network` service, regardless of output count. It
   hosts the registered `omarchy.network` component as the authoritative
-  `Quickshell.Networking`, status, scan, DNS, speed-test, and visible-network
-  action owner while suppressing its stock button, popup, and IPC handler;
+  `Quickshell.Networking`, status, scan, DNS, and visible-network action owner
+  while suppressing its stock button, popup, and IPC handler;
+- Shibumi owns the active `omarchy.network` compatibility handler and the
+  inline speed-test process. Current and legacy host speed-test routes both
+  open the Shibumi Network panel and run bounded `omarchy-network-speedtest`
+  download/upload phases without loading Omarchy's speed-test panel;
 - each output owns only its bar presentation and lazy Shibumi popup. A single
   panel-lifecycle detail sampler feeds the official parser, and a one-shot
   `nmcli` adapter supplies saved profiles absent from Quickshell's visible AP
-  model. Both stop after the final screen-local panel closes. V1's separate
-  permanent Ethernet poller is not restored. Top Wayland mapping and cleanup
-  pass on the validation system; bottom, mutation, and physical multi-output gates remain.
-- G13 has one root-owned `MonitorService` around the registered
-  `omarchy.monitor` component. That hidden component remains the only
+  model. Speed-test and profile workers stop after the final screen-local panel
+  closes; the shared detail sampler remains active only when an Ethernet bar
+  still consumes its throughput data. V1's separate permanent Ethernet poller
+  is not restored. Top Wayland mapping
+  and cleanup pass on the validation system; the new direct speed-test path,
+  bottom, mutation, and physical multi-output remain runtime gates.
+- G13 has one process-wide `hancore.shibumi.brightness` service around the
+  registered `omarchy.monitor` component. That hidden component remains the only
   brightness, display, scale, IPC, poller, and command owner;
 - each output owns only its V1 brightness presentation and a lazy local Shibumi
   panel. The panel delegates brightness, scale, and display mutations to the
@@ -650,20 +676,20 @@ Current Phase 2 foundation:
   mapping, reversible laptop brightness mutation, and a real `1.0 -> 1.25 ->
   1.0` scale round trip pass on the validation system; physical display enable/disable and
   multi-output behavior remain gates.
-- G12 and G14 are separate V1 battery and power-profile presentations over one
-  root-owned `PowerService`. Battery state stays event-driven through the
+- G12 and G14 are separate V1 battery and power-profile presentations over the
+  process-wide `hancore.shibumi.power-state` service. Battery state stays event-driven through the
   shared UPower singleton, battery details are panel-lifecycle gated, and one
   profile refresh/set owner serves every output. The combined `omarchy.power`
   alias is consumed so it cannot run beside the split views; G14 remains
   available on batteryless desktops. the validation system passes a real
   discharging-to-charging transition with matching kernel, UPower, helper,
   widget, and panel state.
-- G15 has one root-owned `BluetoothService` and one native
+- G15 has one process-wide `hancore.shibumi.bluetooth` service and one native
   `BluetoothBackendAdapter`. The adapter owns Quickshell's BlueZ/PipeWire
   models, pairing/device actions, pending state, and Bluetooth-audio handoff;
   no complete Omarchy Bluetooth UI component is instantiated as a backend;
 - each output owns only its V1 Bluetooth presentation and lazy Shibumi device
-  panel. The root service leases discovery across open panels and owns one
+  panel. The process-wide service leases discovery across open panels and owns one
   symmetric six-method `omarchy.bluetooth` IPC target. Presentation has no
   Bluetooth/PipeWire import, process, timer, or file watcher; the service facade
   owns one bounded discovery-reconciliation timer and the adapter owns four
@@ -674,7 +700,7 @@ Current Phase 2 foundation:
   lifecycle pass on the validation system; real device/audio, bottom, and
   physical multi-output gates remain.
 - the interaction foundation has a pure fixed-group layout model, one
-  root-owned persistent controller, and one transient drag session per output;
+  bar-owned persistent controller, and one transient drag session per output;
 - the group renderer resolves Shibumi and official Quattro widgets without
   duplicate state owners, preserves custom host-layout extras, omits empty
   groups without reserving space, and renders persisted within-section split

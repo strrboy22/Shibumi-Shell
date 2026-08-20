@@ -53,10 +53,15 @@ TestCase {
       fail("invalid default picker state")
     if (defaults.reactor.mode !== 0)
       fail("reactor must default to zero-work mode 0")
+    if (defaults.layoutProtection.v1 !== false
+        || defaults.layoutProtection.v2 !== false)
+      fail("layout protection must preserve live editing by default")
     if (!defaults.widgets.G7 || defaults.widgets.G7.enabled !== false
         || !defaults.widgets.G14 || defaults.widgets.G14.enabled !== false
-        || !defaults.widgets.G15 || defaults.widgets.G15.enabled !== false)
-      fail("V1 optional widget defaults")
+        || !defaults.widgets.G15 || defaults.widgets.G15.enabled !== false
+        || !defaults.widgets.G16 || defaults.widgets.G16.source !== "cpu"
+        || defaults.widgets.G16.unit !== "metric")
+      fail("widget defaults")
     if (!defaults.presentation.border || !defaults.presentation.v1Border
         || !defaults.presentation.v2Border || defaults.presentation.shadow
         || defaults.presentation.frost || defaults.presentation.radius !== "large"
@@ -150,7 +155,8 @@ TestCase {
         imageStyle: "omarchy",
         mediaStyle: "hearthstone"
       },
-      reactor: { mode: 7 }
+      reactor: { mode: 7 },
+      layoutProtection: { v1: true, v2: false }
     })
     if (valid.order.left[0] !== "G7" || valid.order.left[6] !== "G1")
       fail("valid order was not retained")
@@ -220,19 +226,22 @@ TestCase {
         || valid.widgets.G7["hancore.shibumi.ai"].aiTool !== "opencode"
         || valid.widgets.G14.enabled !== true
         || valid.widgets.G15.enabled !== false
-        || valid.widgets.G16.source !== "cpu")
+        || valid.widgets.G16.source !== "cpu"
+        || valid.widgets.G16.unit !== "metric")
       fail("widget settings were not sanitized")
     const temperatureState = Config.normalize({
       version: 1,
-      widgets: { G16: { source: "gpu" } }
+      widgets: { G16: { source: "gpu", unit: "imperial" } }
     })
     const unsafeTemperatureState = Config.normalize({
       version: 1,
-      widgets: { G16: { source: "unsafe" } }
+      widgets: { G16: { source: "unsafe", unit: "kelvin" } }
     })
     if (temperatureState.widgets.G16.source !== "gpu"
-        || unsafeTemperatureState.widgets.G16.source !== "cpu")
-      fail("temperature source setting was not normalized")
+        || temperatureState.widgets.G16.unit !== "imperial"
+        || unsafeTemperatureState.widgets.G16.source !== "cpu"
+        || unsafeTemperatureState.widgets.G16.unit !== "metric")
+      fail("temperature settings were not normalized")
     if (valid.presentation.border || valid.presentation.v1Border
         || valid.presentation.v2Border || !valid.presentation.shadow
         || !valid.presentation.frost || valid.presentation.radius !== "small"
@@ -284,6 +293,16 @@ TestCase {
       fail("picker presentation was not normalized")
     if (valid.reactor.mode !== 7)
       fail("reactor mode was not normalized")
+    if (valid.layoutProtection.v1 !== true
+        || valid.layoutProtection.v2 !== false)
+      fail("V1/V2 layout protection was not retained independently")
+    const unsafeProtection = Config.normalize({
+      version: 1,
+      layoutProtection: { v1: "true", v2: 1 }
+    })
+    if (unsafeProtection.layoutProtection.v1 !== false
+        || unsafeProtection.layoutProtection.v2 !== false)
+      fail("non-boolean layout protection did not fail closed")
 
     const carousel = Config.normalize({
       version: 1,

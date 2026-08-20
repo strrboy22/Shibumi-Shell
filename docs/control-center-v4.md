@@ -196,8 +196,19 @@ The bulk Split all and Merge all actions sit directly below Top/Bottom in the
 V1 `Position & Layout` column, using the height beside V1's three surface rows
 instead of consuming another full-width row below.
 V2 exposes a single bar edit mode for adding slots and placing dividers, plus
-layout restore. Bars does not duplicate slot-capacity controls in a second
-editor. V2 never exposes V1 gap-animation or split-island controls. The former
+layout restore. The active generation uses only its concise **V1 LAYOUT** or
+**V2 LAYOUT** heading, without a redundant explanatory paragraph, followed by
+one balanced three-control row: **Edit**, its variant-specific **Lock V1/V2
+layout** toggle, and **Restore**. Edit and Restore retain the established
+horizontal action style; the middle control uses a visible toggle track instead
+of a lock icon. The compact Bars panel derives its fitted height from that
+active page so the complete main route remains visible without scrolling.
+Protection is an independent preference for each generation and both default off. When
+enabled, direct split, divider, and section-boundary clicks require the
+matching edit mode;
+leaving edit mode restores protection without disabling deliberate Bars-page
+bulk or restore actions. Bars does not duplicate slot-capacity controls in a
+second editor. V2 never exposes V1 gap-animation or split-island controls. The former
 Layout deep links remain compatible by resolving directly to Bars; there is no
 second Layout editor in Configure, search, Icons, or Bars navigation.
 
@@ -246,6 +257,7 @@ The Bars page selects its layout section from the active Shibumi presentation:
 | Locked base slots | `7 / 1 / 7` | Yes |
 | Optional outer slots | Up to two per side | Style-defined capacity |
 | Persistent manual dividers | No | Yes |
+| Independent direct-edit protection | Yes | Yes |
 | Restore active layout | Yes | Yes |
 
 V1 controls are not merely described as incompatible on V2: they are removed
@@ -324,13 +336,21 @@ chip total therefore does not indicate a catalog mismatch.
 The theme-aware gloss runs once when the page opens and again only after a
 provider count changes; reduced motion keeps a static highlight.
 
-**Check plugin** below **Add plugin** first performs a read-only fetch of every
-independently installed Git-managed plugin. The terminal reports the number of
-available updates and offers a multi-selection. Only the selected plugins are
-then passed individually to Omarchy's validating `omarchy-plugin-update`
-command. Non-Git plugin directories are reported as not automatically
-checkable rather than treated as current. Shibumi does not silently update
-third-party code.
+**Check plugins** below **Add plugin** first performs a bounded read-only scan of
+every independently installed Git-managed plugin. A compact text line below
+the button reports the result, for example `0 available`, while the tooltip
+and accessibility description spell out checked, unmanaged, and failed totals
+without duplicating the provider inventory above. The scan is shared across
+outputs, invalidated when the plugin registry changes, and stopped when no
+plugin catalog is visible.
+
+The terminal reports the number of available updates and offers a
+multi-selection. Only the selected plugins are then passed individually to
+Omarchy's validating `omarchy-plugin-update` command. Omarchy remains the owner
+of changed-code review: long diffs use its normal pager, which is exited with
+`q` before the final confirmation. Non-Git plugin directories are reported as
+not automatically checkable rather than treated as current. Shibumi does not
+silently update third-party code.
 
 Every plugin card, including a card revealed by search, exposes a star action.
 Starred plugin IDs are persisted in `bar.shibumi.plugins.favorites`. The
@@ -437,7 +457,16 @@ not secondary sections inside Icons:
   capability context; the Launcher omits the generic Presentation control
   because Logo owns its identity. Split, gap, slot, and bar-divider ownership
   remains in Bars and is not duplicated here. Icons alone uses a shorter semantic page
-  preview, which disappears during focused editing.
+  preview, which remains centered and disappears during focused editing. In
+  each overview, `RESET V1 DEFAULTS` or `RESET V2 DEFAULTS` follows
+  `ACTIVE WIDGETS |` in the same header typography. It uses semantic
+  `color03`; its confirmation changes to `color01`. It requires a second
+  confirmation click, resets every official widget appearance for the active
+  generation in one transaction, and preserves the other generation's
+  appearance, launcher identity, activation, placement, splits, dividers, and
+  nonvisual settings. Active/inactive transfer controls use a full-height,
+  softly tonal tile-edge strip without an internal divider. Hover and keyboard
+  focus promote the strip and arrow with semantic `color03`.
 
 The Workspaces and Pickers controls are not repeated on another page. Quick
 may still expose whether the Workspaces widget is shown; that is widget

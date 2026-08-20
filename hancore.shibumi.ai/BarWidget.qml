@@ -24,10 +24,9 @@ Ui.Panel {
     ? 0 : Math.round(usagePercent / 5) * 5
   readonly property var tokens: bar && "visualTokens" in bar
     && bar.visualTokens ? bar.visualTokens : hostTokens
-  // V1 keeps the source widget's ink -> seal fill. On a V2 custom fill,
-  // mirror the source's single contrast-aware contentColor for both layers.
+  // Preserve the source ink -> seal treatment while appearance is inherited.
+  // Any explicit V1 or V2 fill uses one contrast-aware tone for both layers.
   readonly property bool customFillActive: !!(tokens
-    && tokens.v2Shell === true
     && typeof tokens.widgetHasFill === "function"
     && tokens.widgetHasFill(settings))
   readonly property color defaultUsageIconColor: bar
@@ -55,12 +54,14 @@ Ui.Panel {
   readonly property bool compact: displayMode === "icon"
   readonly property int providerIconSlotWidth: 20
   readonly property int providerIconSlotHeight: 16
+  readonly property int claudeGlyphPixelSize: 15
   readonly property int providerGlyphWidth: providerId === "opencode" ? 20
     : providerId === "codex" ? 14 : 15
   readonly property int providerGlyphHeight: providerId === "opencode" ? 12
     : providerId === "codex" ? 14 : 15
-  readonly property int providerGlyphHorizontalOffset:
-    providerId === "codex" ? -1 : 0
+  readonly property int providerGlyphHorizontalOffset: 0
+  readonly property int providerContentHorizontalOffset:
+    providerId === "codex" && displayMode !== "text" ? -1 : 0
   readonly property var interactionTarget: actionButton
   readonly property bool panelLoaded: panelLoader.item !== null
   readonly property var panelItem: panelLoader.item
@@ -87,7 +88,8 @@ Ui.Panel {
 
   function childPanelWidget(pluginId) {
     const id = String(pluginId || "")
-    return id === moduleName || id === "omarchy.model-usage" ? root : null
+    return id === moduleName || id === "omarchy.agents"
+      || id === "omarchy.model-usage" ? root : null
   }
 
   onOpenedChanged: syncPanelLoader()
@@ -104,6 +106,7 @@ Ui.Panel {
     PillSurface {
       tokenSource: root.tokens
       settings: root.settings
+      v1AppearanceEnabled: true
       anchors.fill: parent
       anchors.topMargin: root.tokens
         ? Math.round((parent.height - root.tokens.pillHeight) / 2) : 0
@@ -137,6 +140,7 @@ Ui.Panel {
     Row {
       id: contentRow
       anchors.centerIn: parent
+      anchors.horizontalCenterOffset: root.providerContentHorizontalOffset
       spacing: root.tokens ? root.tokens.compactGap : Commons.Style.space(5)
 
       Item {
@@ -166,7 +170,7 @@ Ui.Panel {
                 root.baseIconColor.g, root.baseIconColor.b,
                 root.baseIconOpacity)
               font.family: root.bar ? root.bar.fontFamily : Commons.Style.font.family
-              font.pixelSize: 14
+              font.pixelSize: root.claudeGlyphPixelSize
               renderType: Text.QtRendering
             }
 
@@ -189,7 +193,7 @@ Ui.Panel {
                 text: "\udb85\ude7a"
                 color: root.usageIconColor
                 font.family: root.bar ? root.bar.fontFamily : Commons.Style.font.family
-                font.pixelSize: 14
+                font.pixelSize: root.claudeGlyphPixelSize
                 renderType: Text.QtRendering
               }
             }

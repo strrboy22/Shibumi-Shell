@@ -43,6 +43,12 @@ Ui.Panel {
   readonly property color activeColor: bar
     ? bar.urgent : Commons.Color.bar.active
   property color contentColor: activeColor
+  property bool customToneActive: false
+  property color badgeContrastColor: bar
+    ? bar.background : Commons.Color.background
+  readonly property color badgeFillColor: updateBadge.color
+  readonly property color badgeTextColor: badgeText.color
+  readonly property real badgeLayer: updateBadge.z
   readonly property string fontFamily: bar
     ? String(bar.fontFamily || Commons.Style.font.family)
     : Commons.Style.font.family
@@ -166,6 +172,7 @@ Ui.Panel {
       }
 
       Rectangle {
+        id: updateBadge
         visible: root.updateCount > 0
         anchors.verticalCenter: updateIcon.verticalCenter
         anchors.verticalCenterOffset: -Commons.Style.space(6)
@@ -176,12 +183,16 @@ Ui.Panel {
         height: Commons.Style.space(12)
         radius: height / 2
         color: root.contentColor
+        border.width: 0
+        border.color: "transparent"
+        z: 10
 
         Text {
           id: badgeText
           anchors.centerIn: parent
           text: root.updateCount > 99 ? "99+" : String(root.updateCount)
-          color: Commons.Color.background
+          color: root.customToneActive
+            ? root.badgeContrastColor : Commons.Color.background
           font.family: root.fontFamily
           font.pixelSize: Math.max(Commons.Style.space(7),
             Commons.Style.font.caption - 3)

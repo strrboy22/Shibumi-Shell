@@ -12,6 +12,7 @@ Item {
   required property var stateService
   required property var healthService
   required property var switchService
+  required property var pluginUpdateService
 
   readonly property bool open: ownerWidget.opened
   readonly property var healthReport: healthService.report
@@ -32,6 +33,10 @@ Item {
     return effective
   }
   readonly property var workspaceConfig: stateConfig.workspace || ({})
+  readonly property var layoutProtection: stateConfig.layoutProtection
+    || ({ v1: false, v2: false })
+  readonly property bool v1LayoutProtected: layoutProtection.v1 === true
+  readonly property bool v2LayoutProtected: layoutProtection.v2 === true
   readonly property var pluginConfig: stateConfig.plugins || ({})
   readonly property var pluginFavorites: Array.isArray(pluginConfig.favorites)
     ? pluginConfig.favorites : []
@@ -100,6 +105,16 @@ Item {
   readonly property string quickProfileLabel: "Balanced"
   readonly property bool pluginsScanning: false
   property bool pluginRemovalRunning: false
+  readonly property bool pluginUpdateCheckRunning:
+    pluginUpdateService.running === true
+  readonly property int pluginUpdateCount: pluginUpdateService.updateCount
+  readonly property int pluginUpdateFailedCount: pluginUpdateService.failedCount
+  readonly property string pluginUpdateCheckError: pluginUpdateService.error
+  readonly property string pluginUpdateShortStatusText:
+    pluginUpdateService.shortStatusText
+  readonly property string pluginUpdateStatusText: pluginUpdateService.statusText
+  readonly property var effectivePluginUpdateService: pluginUpdateService
+  property bool rejectProviderRestore: false
   readonly property string pluginRemovalId: ""
   signal pluginRemovalFinished(
     string pluginId, bool success, string detail)
@@ -144,7 +159,11 @@ Item {
       installedInBar: false,
       group: "",
       replacementGroup: "G6",
+      replacementGroups: ["G6"],
       replacementTarget: "Shibumi Audio",
+      replacementTargetStates: ({
+        G6: { v1: true, v2: false }
+      }),
       replacementTargetEnabled: true,
       replacementInEffect: false,
       replacementLabel: "Replaces Shibumi Audio",
@@ -216,6 +235,9 @@ Item {
   readonly property var settingsPageItem: settings.pageItem
   readonly property real configureDetailPanelChromeHeight:
     settings.configureDetailPanelChromeHeight
+  readonly property bool compactBarsPage: settings.compactBarsPage
+  readonly property real compactBarsPanelHeight:
+    settings.compactBarsPanelHeight
   readonly property real compactIconsPanelHeight:
     settings.compactIconsPanelHeight
   readonly property bool compactIconsSelection:
@@ -232,6 +254,12 @@ Item {
   readonly property var settingsPageOptions: settings.pageOptions
   readonly property bool pluginInstallerOpen: settings.paletteOpen
     && settings.installMode && settings.installerDirect
+  readonly property string pluginInstallUrl: settings.installUrl
+  readonly property string normalizedPluginInstallUrl:
+    settings.normalizedInstallUrl
+  readonly property bool validPluginInstallUrl: settings.validInstallUrl
+  readonly property bool pluginInstallInputWasCommand:
+    settings.installInputWasCommand
   readonly property var settingsSearchSuggestions:
     settings.settingsSearchSuggestions
   readonly property var settingsSearchResults:
@@ -341,6 +369,14 @@ Item {
         ? stateService.resetGroupAppearance(groupId) : false
   }
 
+  function resetAllGroupAppearances(variantValue) {
+    const variant = String(variantValue || "").toLowerCase()
+    return ["v1", "v2"].indexOf(variant) >= 0
+      && stateService
+      && typeof stateService.resetAllGroupAppearancesForVariant === "function"
+      ? stateService.resetAllGroupAppearancesForVariant(variant) : false
+  }
+
   function setBarPresentation(name, value) {
     const presentationName = String(name || "")
     const preservePanel = [
@@ -360,6 +396,24 @@ Item {
     if (!changed && preservePanel && restoreBar
         && typeof restoreBar.cancelWidgetRestore === "function")
       restoreBar.cancelWidgetRestore("hancore.shibumi.control-center")
+    return changed
+  }
+
+  function setLayoutProtection(variant, enabled) {
+    const requested = String(variant || "").toLowerCase()
+    if (["v1", "v2"].indexOf(requested) < 0
+        || typeof enabled !== "boolean") return false
+    const restoreBar = bar
+    const created = restoreBar
+      && typeof restoreBar.scheduleOpenControlCenterRestores === "function"
+      ? restoreBar.scheduleOpenControlCenterRestores(
+          settings.restorePage, false, ownerWidget, "") : []
+    const changed = stateService
+      && typeof stateService.setLayoutProtection === "function"
+      ? stateService.setLayoutProtection(requested, enabled) : false
+    if (!changed && restoreBar
+        && typeof restoreBar.cancelCreatedWidgetRestores === "function")
+      restoreBar.cancelCreatedWidgetRestores(created)
     return changed
   }
 
@@ -540,7 +594,30 @@ Item {
     return settings.openPluginInstaller()
   }
 
+  function extractPluginInstallUrl(value) {
+    return settings.extractInstallUrl(value)
+  }
+
+  function pluginInstallCommandFor(value) {
+    return settings.pluginInstallCommand(value)
+  }
+
+  function setPluginInstallInput(value) {
+    settings.installUrl = String(value || "")
+    settings.installConfirmed = false
+    settings.installStatus = ""
+    return settings.normalizedInstallUrl
+  }
+
+  function normalizePluginInstallInput() {
+    return settings.normalizeInstallInput()
+  }
+
   property int pluginUpdaterOpenCount: 0
+
+  function checkPluginUpdates(force) {
+    return pluginUpdateService.check(force === true)
+  }
 
   function openPluginUpdater() {
     pluginUpdaterOpenCount++
@@ -582,9 +659,49 @@ Item {
     return true
   }
 
-  function restoreShibumiProvider(groupId) {
-    return String(groupId || "") === "G6"
+  function restoreShibumiProviders(groupValues) {
+    return !rejectProviderRestore
+      && Array.isArray(groupValues)
+      && groupValues.length === 1
+      && String(groupValues[0] || "") === "G6"
       && setPluginEnabled("hancore.shibumi.audio", true)
+  }
+
+  function restoreShibumiProviderStates(stateValues) {
+    return !rejectProviderRestore
+      && stateValues && stateValues.G6
+      && stateValues.G6.v1 === true
+      && stateValues.G6.v2 === false
+      && setPluginEnabled("hancore.shibumi.audio", true)
+  }
+
+  function providerUndoSnapshot(pluginId) {
+    return String(pluginId || "") === "omarchy.audio"
+      ? { token: "audio-provider-snapshot" } : null
+  }
+
+  function restoreProviderUndoSnapshot(snapshotValue) {
+    const restoreBar = bar
+    if (restoreBar
+        && typeof restoreBar.scheduleWidgetRestore === "function")
+      restoreBar.scheduleWidgetRestore(
+        "hancore.shibumi.control-center", settings.restorePage, true)
+    const restored = !rejectProviderRestore && snapshotValue
+      && snapshotValue.token === "audio-provider-snapshot"
+      && setPluginEnabled("hancore.shibumi.audio", true)
+    if (!restored && restoreBar
+        && typeof restoreBar.cancelWidgetRestore === "function")
+      restoreBar.cancelWidgetRestore("hancore.shibumi.control-center")
+    return restored
+  }
+
+  function setProviderGroupStates(stateValues) {
+    return !rejectProviderRestore && stateValues
+      && typeof stateValues === "object"
+  }
+
+  function restoreShibumiProvider(groupId) {
+    return restoreShibumiProviders([String(groupId || "")])
   }
 
   function removePlugin(pluginId) {

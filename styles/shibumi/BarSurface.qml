@@ -24,6 +24,11 @@ Item {
     ? bar.shell.serviceFor("hancore.shibumi.reactor") : null
   readonly property int reactorMode: reactorFacade
     ? Number(reactorFacade.mode || 0) : 0
+  readonly property bool layoutProtected: bar.layoutController
+    && "activeLayoutProtected" in bar.layoutController
+    && bar.layoutController.activeLayoutProtected === true
+  readonly property bool layoutChangesAllowed:
+    layoutSession && layoutSession.editing || !layoutProtected
   focus: layoutSession && layoutSession.editing
 
   Loader {
@@ -187,7 +192,10 @@ Item {
       }
 
       function toggleBoundary(index) {
-        root.bar.layoutController.toggleSplit("boundaries", index)
+        if (!root.layoutChangesAllowed) return false
+        return root.bar.layoutController.toggleSplit(
+          "boundaries", index,
+          root.layoutSession && root.layoutSession.editing)
       }
 
       function updateNarrowStage() {
@@ -245,7 +253,9 @@ Item {
         screenName: root.screenName
         screenX: horizontalSurface.shellX
         runs: horizontalSurface.runs
-        visible: !root.bar.transparent
+        // V1 and every V2 shell form are intentionally opaque. The saved
+        // transparency preference belongs only to the stock Omarchy bar.
+        visible: true
         x: horizontalSurface.shellX
         width: Math.max(0, horizontalSurface.shellWidth)
         height: horizontalSurface.shibumiShell
@@ -339,6 +349,10 @@ Item {
 
         Shibumi.GroupSection {
           id: leftGroups
+          // Provider-owned extras may follow the full bar height while the
+          // grouped V1 row remains 32px. Center both siblings independently
+          // so either height cannot displace the other from the island axis.
+          anchors.verticalCenter: parent.verticalCenter
           bar: root.bar
           region: "left"
           screenName: root.screenName
@@ -348,6 +362,7 @@ Item {
 
         Core.BarSection {
           id: leftExtras
+          anchors.verticalCenter: parent.verticalCenter
           bar: root.bar
           region: "left-extra"
           screenName: root.screenName
@@ -368,6 +383,7 @@ Item {
 
         Shibumi.GroupSection {
           id: centerGroups
+          anchors.verticalCenter: parent.verticalCenter
           bar: root.bar
           region: "center"
           screenName: root.screenName
@@ -378,6 +394,7 @@ Item {
 
         Core.BarSection {
           id: centerExtras
+          anchors.verticalCenter: parent.verticalCenter
           bar: root.bar
           region: "center-extra"
           screenName: root.screenName
@@ -396,6 +413,7 @@ Item {
 
         Core.BarSection {
           id: rightExtras
+          anchors.verticalCenter: parent.verticalCenter
           bar: root.bar
           region: "right-extra"
           screenName: root.screenName
@@ -404,6 +422,7 @@ Item {
 
         Shibumi.GroupSection {
           id: rightGroups
+          anchors.verticalCenter: parent.verticalCenter
           bar: root.bar
           region: "right"
           screenName: root.screenName
@@ -463,7 +482,7 @@ Item {
         MouseArea {
           id: boundaryMouse
           anchors.fill: parent
-          enabled: true
+          enabled: root.layoutChangesAllowed
           hoverEnabled: true
           acceptedButtons: Qt.LeftButton
           cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor

@@ -6,8 +6,9 @@ import Quickshell.Networking
 
 // One process-wide NetworkManager owner for every Shibumi output. Quattro's
 // official network component remains authoritative for live status, details,
-// scanning, DNS, speed tests, and visible-network actions. This service adds
-// only the saved-profile view that the host networking API does not expose.
+// DNS, and visible-network actions. Shibumi owns the session-scoped scanner
+// lease required by its hidden backend, its inline speed-test process, and the
+// saved-profile view missing from the host API.
 Item {
   id: root
 
@@ -18,13 +19,32 @@ Item {
   property Component panelComponent: String(panelSource) ? null
     : registeredComponent("omarchy.network")
   readonly property var backend: bridge.panel
+  readonly property url speedTestRunnerSource:
+    Qt.resolvedUrl("InlineSpeedTestRunner.py")
+  property string speedTestExecutable: "omarchy-network-speedtest"
+  property int speedTestPhaseDuration: 5000
+  readonly property bool speedTestReady: String(speedTestRunnerSource) !== ""
+    && String(speedTestExecutable || "") !== ""
+  property bool speedTestRunning: false
+  readonly property bool speedTestHasRun: speedTestDownloadMbps !== ""
+    || speedTestUploadMbps !== ""
+  property string speedTestPhase: ""
+  property string speedTestDownloadMbps: ""
+  property string speedTestUploadMbps: ""
+  property string speedTestError: ""
+  property bool speedTestExpectedStop: false
+  property bool speedTestPendingRun: false
+  property bool speedTestProcessStarted: false
+  property string speedTestStderr: ""
   readonly property bool ready: backend !== null
   readonly property bool backendAvailable: ready && bridge.backendAvailable
   readonly property string kind: bridge.kind
   readonly property string label: bridge.label !== ""
     ? bridge.label : connectedVisibleLabel(visibleNetworks)
   readonly property int signalStrength: bridge.signalStrength
-  readonly property bool scanning: bridge.scanning
+  property bool scanPending: false
+  property var scannerDevice: null
+  readonly property bool scanning: bridge.scanning || scanPending
   readonly property bool busy: bridge.busy || profileAction.running
   readonly property bool wifiEnabled: Networking.wifiEnabled
   readonly property bool wifiAvailable: backend
@@ -42,16 +62,6 @@ Item {
     ? String(backend.dnsProvider || "DHCP") : "DHCP"
   readonly property var dnsProviders: backend && backend.dnsProviders
     ? backend.dnsProviders : ["DHCP", "Cloudflare", "Google", "Custom"]
-  readonly property bool speedTestRunning: backend
-    ? backend.speedTestRunning === true : false
-  readonly property bool speedTestHasRun: speedTestDownloadMbps !== ""
-    || speedTestUploadMbps !== ""
-  readonly property string speedTestPhase: backend ? String(backend.speedTestPhase || "") : ""
-  readonly property string speedTestDownloadMbps: backend
-    ? String(backend.speedTestDownloadMbps || "") : ""
-  readonly property string speedTestUploadMbps: backend
-    ? String(backend.speedTestUploadMbps || "") : ""
-  readonly property string speedTestError: backend ? String(backend.speedTestError || "") : ""
   readonly property string actionSsid: backend ? String(backend.actionSsid || "") : ""
   readonly property string actionKind: backend ? String(backend.actionKind || "") : ""
   readonly property string failureSsid: backend ? String(backend.failureSsid || "") : ""
@@ -97,20 +107,65 @@ Item {
     return ""
   }
 
+  function activeWifiDevice() {
+    return ready && backend && backend.wifiDevice
+      ? backend.wifiDevice : null
+  }
+
+  function setSessionScannerEnabled(enabled) {
+    const nextDevice = sessionCount > 0 ? activeWifiDevice() : null
+    if (scannerDevice && scannerDevice !== nextDevice)
+      scannerDevice.scannerEnabled = false
+    scannerDevice = nextDevice
+    if (!scannerDevice) return false
+    scannerDevice.scannerEnabled = enabled === true
+    return true
+  }
+
+  function releaseWifiScanner() {
+    scanRestart.stop()
+    scanDone.stop()
+    scanPending = false
+    const currentDevice = activeWifiDevice()
+    if (scannerDevice) scannerDevice.scannerEnabled = false
+    if (currentDevice && currentDevice !== scannerDevice)
+      currentDevice.scannerEnabled = false
+    scannerDevice = null
+  }
+
+  function requestWifiScan() {
+    scanRestart.stop()
+    scanDone.stop()
+    if (sessionCount <= 0 || !activeWifiDevice()) {
+      releaseWifiScanner()
+      return false
+    }
+    scanPending = true
+    setSessionScannerEnabled(false)
+    scanRestart.restart()
+    return true
+  }
+
+  function completeWifiScan() {
+    scanPending = false
+    if (backend && typeof backend.syncWifiNetworks === "function")
+      backend.syncWifiNetworks()
+  }
+
   visible: false
   width: 0
   height: 0
 
   onReadyChanged: {
-    if (ready && backend && sessionCount === 0 && backend.wifiDevice)
-      backend.wifiDevice.scannerEnabled = false
+    if (!ready || sessionCount === 0) releaseWifiScanner()
+    else requestWifiScan()
   }
 
   Connections {
     target: root.backend
     function onWifiDeviceChanged() {
-      if (root.backend && root.sessionCount === 0 && root.backend.wifiDevice)
-        root.backend.wifiDevice.scannerEnabled = false
+      if (root.sessionCount > 0) root.requestWifiScan()
+      else root.releaseWifiScanner()
     }
   }
 
@@ -131,11 +186,10 @@ Item {
 
   function endSession(owner) {
     if (!owner) return
-    sessionOwners = sessionOwners.filter(candidate => candidate !== owner)
+    const nextOwners = sessionOwners.filter(candidate => candidate !== owner)
+    if (nextOwners.length === 0) stopSpeedTest()
+    sessionOwners = nextOwners
     if (sessionCount !== 0) return
-    if (speedTestRunning && backend
-        && typeof backend.hideSpeedTest === "function")
-      backend.hideSpeedTest()
     // Ethernet bar presentations consume the same central throughput sample as
     // the panel. Keep that one worker alive while a wired route is active.
     if (kind !== "ethernet") {
@@ -143,15 +197,24 @@ Item {
       detailsProc.running = false
     }
     profileList.running = false
-    if (backend && backend.wifiDevice) backend.wifiDevice.scannerEnabled = false
+    releaseWifiScanner()
   }
 
   function refresh(scanWifi) {
     if (!ready || typeof backend.refresh !== "function") return false
-    const shouldScanWifi = scanWifi === true && wifiAvailable
-    backend.refresh(shouldScanWifi)
-    if (sessionCount > 0 && shouldScanWifi && !profileList.running)
-      refreshProfiles()
+    const shouldScanWifi = scanWifi === true && activeWifiDevice() !== null
+    // The hidden backend may gate its own scanner on `opened`, while older
+    // hosts enable it synchronously even for refresh(false). A requested scan
+    // therefore defers every backend refresh until our scanner lease starts.
+    if (shouldScanWifi) {
+      requestWifiScan()
+      if (sessionCount > 0 && !profileList.running) refreshProfiles()
+      return true
+    }
+    if (scanPending) return true
+    backend.refresh(false)
+    if (sessionCount > 0) setSessionScannerEnabled(true)
+    else releaseWifiScanner()
     return true
   }
 
@@ -172,9 +235,9 @@ Item {
     case WifiSecurityType.StaticWep:
     case WifiSecurityType.DynamicWep: return "wep"
     case WifiSecurityType.WpaEap:
-    case WifiSecurityType.Wpa2Eap:
+    case WifiSecurityType.Wpa2Eap: return "enterprise"
     case WifiSecurityType.Wpa3SuiteB192:
-    case WifiSecurityType.Leap: return "enterprise"
+    case WifiSecurityType.Leap: return "unsupported"
     default: return "unknown"
     }
   }
@@ -196,35 +259,78 @@ Item {
     }
   }
 
-  function profileSecurityLabel(keyManagement) {
+  function profileSecurityLabel(keyManagement, authAlgorithm) {
     switch (String(keyManagement || "").toLowerCase()) {
     case "wpa-psk": return "WPA Personal profile"
     case "sae": return "WPA3 Personal profile"
     case "owe": return "Enhanced Open profile"
     case "wpa-eap": return "WPA Enterprise profile"
-    case "ieee8021x": return "802.1X profile"
-    case "none": return "Open or WEP profile"
+    case "wpa-eap-suite-b-192": return "WPA3 Suite B profile"
+    case "ieee8021x": return String(authAlgorithm || "").toLowerCase()
+      === "leap" ? "LEAP profile" : "802.1X profile"
+    case "open": return "Open profile"
+    case "none": return "WEP profile"
     default: return "Saved Wi-Fi profile"
     }
+  }
+
+  function profileMatchesSecurity(profile, security) {
+    const keyManagement = String(profile && profile.keyManagement || "")
+      .toLowerCase()
+    switch (keyManagement) {
+    case "wpa-psk":
+      return security === WifiSecurityType.WpaPsk
+        || security === WifiSecurityType.Wpa2Psk
+    case "sae": return security === WifiSecurityType.Sae
+    case "owe": return security === WifiSecurityType.Owe
+    case "wpa-eap":
+      return security === WifiSecurityType.WpaEap
+        || security === WifiSecurityType.Wpa2Eap
+    case "wpa-eap-suite-b-192":
+      return security === WifiSecurityType.Wpa3SuiteB192
+    case "ieee8021x":
+      return String(profile.authAlgorithm || "").toLowerCase() === "leap"
+        ? security === WifiSecurityType.Leap
+        : security === WifiSecurityType.DynamicWep
+    case "open": return security === WifiSecurityType.Open
+    case "none": return security === WifiSecurityType.StaticWep
+    default: return false
+    }
+  }
+
+  function profileVisibleMatchCount(profile, visible) {
+    if (!profile || !Array.isArray(visible)) return 0
+    let count = 0
+    for (let i = 0; i < visible.length; i++) {
+      const candidate = visible[i]
+      if (candidate && candidate.ssid === profile.ssid
+          && profileMatchesSecurity(profile, candidate.security)) count++
+    }
+    return count
   }
 
   function mergedNetworks(visible, profiles) {
     const rows = []
     const visibleRows = Array.isArray(visible) ? visible : []
     const savedRows = Array.isArray(profiles) ? profiles : []
+    const representedProfileUuids = ({})
 
     for (let i = 0; i < visibleRows.length; i++) {
       const source = visibleRows[i]
       if (!source) continue
-      let profile = null
+      const matchingProfiles = []
       for (let p = 0; p < savedRows.length; p++) {
-        if (savedRows[p] && savedRows[p].ssid === source.ssid) {
-          profile = savedRows[p]
-          break
-        }
+        const candidate = savedRows[p]
+        if (candidate && candidate.ssid === source.ssid
+            && profileMatchesSecurity(candidate, source.security))
+          matchingProfiles.push(candidate)
       }
+      const profile = matchingProfiles.length === 1
+        && profileVisibleMatchCount(matchingProfiles[0], visibleRows) === 1
+        ? matchingProfiles[0] : null
+      if (profile && String(profile.uuid || ""))
+        representedProfileUuids[String(profile.uuid)] = true
       rows.push({
-        network: source.network || null,
         connected: source.connected === true,
         known: source.known === true || profile !== null,
         ssid: String(source.ssid || ""),
@@ -242,15 +348,8 @@ Item {
 
     for (let p = 0; p < savedRows.length; p++) {
       const profile = savedRows[p]
-      if (!profile) continue
-      let represented = false
-      for (let i = 0; i < rows.length; i++) {
-        if (rows[i].ssid === profile.ssid) {
-          represented = true
-          break
-        }
-      }
-      if (represented) continue
+      if (!profile || representedProfileUuids[String(profile.uuid || "")])
+        continue
       rows.push({
         network: null,
         connected: false,
@@ -259,7 +358,8 @@ Item {
         signal: 0,
         security: null,
         securityKind: "saved",
-        securityLabel: profileSecurityLabel(profile.keyManagement),
+        securityLabel: profileSecurityLabel(profile.keyManagement,
+          profile.authAlgorithm),
         visible: false,
         profileUuid: String(profile.uuid || ""),
         lastSuccessful: Number(profile.lastSuccessful || 0),
@@ -276,49 +376,143 @@ Item {
     return rows
   }
 
+  function visibleIdentityMatchCount(entry) {
+    if (!entry || entry.visible === false) return 0
+    const ssid = String(entry.ssid || "")
+    if (!ssid) return 0
+    const expectedKind = String(entry.securityKind
+      || securityKind(entry.security))
+    const hasExactSecurity = entry.security !== undefined
+      && entry.security !== null
+    const rows = Array.isArray(visibleNetworks) ? visibleNetworks : []
+    let count = 0
+    for (let i = 0; i < rows.length; i++) {
+      const candidate = rows[i]
+      if (!candidate || String(candidate.ssid || "") !== ssid) continue
+      if (hasExactSecurity && candidate.security !== entry.security) continue
+      if (!hasExactSecurity
+          && securityKind(candidate.security) !== expectedKind) continue
+      count++
+    }
+    return count
+  }
+
+  function hasUniqueVisibleIdentity(entry) {
+    return visibleIdentityMatchCount(entry) === 1
+  }
+
+  function currentVisibleEntry(entry) {
+    if (!entry || entry.visible === false) return null
+    const ssid = String(entry.ssid || "")
+    const hasExactSecurity = entry.security !== undefined
+      && entry.security !== null
+    const expectedKind = String(entry.securityKind
+      || securityKind(entry.security))
+    const rows = mergedNetworks(visibleNetworks, savedProfiles)
+    let result = null
+    let count = 0
+    for (let i = 0; i < rows.length; i++) {
+      const candidate = rows[i]
+      if (!candidate || candidate.visible === false
+          || String(candidate.ssid || "") !== ssid) continue
+      if (hasExactSecurity && candidate.security !== entry.security) continue
+      if (!hasExactSecurity && candidate.securityKind !== expectedKind) continue
+      result = candidate
+      count++
+    }
+    return count === 1 ? result : null
+  }
+
+  function savedProfileMatchCount(entry) {
+    if (!entry || !Array.isArray(savedProfiles)) return 0
+    let count = 0
+    for (let i = 0; i < savedProfiles.length; i++) {
+      const profile = savedProfiles[i]
+      if (profile && profile.ssid === entry.ssid
+          && profileMatchesSecurity(profile, entry.security)) count++
+    }
+    return count
+  }
+
+  function visibleSsidMatchCount(entry) {
+    const ssid = String(entry && entry.ssid || "")
+    if (!ssid || !Array.isArray(visibleNetworks)) return 0
+    let count = 0
+    for (let i = 0; i < visibleNetworks.length; i++) {
+      const candidate = visibleNetworks[i]
+      if (candidate && String(candidate.ssid || "") === ssid) count++
+    }
+    return count
+  }
+
+  function hasUnambiguousVisibleSsid(entry) {
+    return hasUniqueVisibleIdentity(entry)
+      && visibleSsidMatchCount(entry) === 1
+  }
+
   function connect(entry) {
     if (!entry || busy) return false
     profileError = ""
-    if (!entry.network && entry.profileUuid)
+    if (entry.profileUuid && entry.visible === false)
       return runProfileAction("connect", entry.profileUuid)
-    if (!entry.network || !ready) return false
+    if (!ready || !hasUniqueVisibleIdentity(entry)) return false
     if (entry.connected) return disconnect(entry)
-    if (entry.known || entry.securityKind === "open") {
-      backend.connectKnown(entry.ssid)
+    if (entry.profileUuid)
+      return runProfileAction("connect", entry.profileUuid)
+    if (hasUnambiguousVisibleSsid(entry)
+        && (entry.known || entry.securityKind === "open")
+        && typeof backend.connectKnown === "function") {
+      backend.connectKnown(String(entry.ssid || ""))
       return true
     }
     return false
   }
 
   function connectWithPassphrase(entry, passphrase) {
-    if (!entry || !entry.network || entry.securityKind !== "psk"
-        || !String(passphrase || "") || !ready || busy) return false
+    const current = currentVisibleEntry(entry)
+    if (!entry || entry.securityKind !== "psk"
+        || !String(passphrase || "") || !ready || busy
+        || !hasUnambiguousVisibleSsid(entry) || !current
+        || current.connected === true || current.known === true
+        || savedProfileMatchCount(entry) > 0
+        || typeof backend.connectWithPassphrase !== "function") return false
     profileError = ""
-    backend.connectWithPassphrase(entry.ssid, String(passphrase))
+    backend.connectWithPassphrase(String(entry.ssid || ""), String(passphrase))
     return true
   }
 
   function connectEnterprise(entry, identity, passphrase) {
-    if (!entry || !entry.network || entry.securityKind !== "enterprise"
+    const current = currentVisibleEntry(entry)
+    if (!entry || entry.securityKind !== "enterprise"
         || !String(identity || "") || !String(passphrase || "")
-        || !ready || busy) return false
+        || !ready || busy || !hasUnambiguousVisibleSsid(entry) || !current
+        || current.connected === true || current.known === true
+        || savedProfileMatchCount(entry) > 0
+        || typeof backend.connectEnterprise !== "function") return false
     profileError = ""
-    backend.connectEnterprise(entry.ssid, String(identity), String(passphrase))
+    backend.connectEnterprise(String(entry.ssid || ""),
+      String(identity), String(passphrase))
     return true
   }
 
   function disconnect(entry) {
-    if (!ready || busy) return false
-    backend.disconnect(entry && entry.network ? entry.network : null)
+    if (!entry || entry.connected !== true || !ready || busy
+        || !hasUnambiguousVisibleSsid(entry)
+        || typeof backend.disconnectRow !== "function") return false
+    backend.disconnectRow(String(entry.ssid || ""))
     return true
   }
 
   function forget(entry) {
     if (!entry || !entry.known || busy) return false
     profileError = ""
-    if (!entry.network && entry.profileUuid)
+    if (entry.profileUuid && entry.visible === false)
       return runProfileAction("forget", entry.profileUuid)
-    if (!entry.network || !ready) return false
+    if (!ready || !hasUniqueVisibleIdentity(entry)) return false
+    if (entry.profileUuid)
+      return runProfileAction("forget", entry.profileUuid)
+    if (!hasUnambiguousVisibleSsid(entry)
+        || typeof backend.forget !== "function") return false
     backend.forget(entry)
     return true
   }
@@ -329,10 +523,124 @@ Item {
     return true
   }
 
+  function speedTestCommandFor(phaseValue) {
+    return [String(speedTestRunnerSource),
+      String(speedTestExecutable || ""), String(phaseValue || "")]
+  }
+
+  function updateSpeedTestLine(line) {
+    const raw = String(line || "").trim()
+    if (!/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(raw)) return
+    const value = Number(raw)
+    if (!isFinite(value) || value < 0) return
+    const normalized = String(value)
+    if (speedTestPhase === "down") speedTestDownloadMbps = normalized
+    else if (speedTestPhase === "up") speedTestUploadMbps = normalized
+  }
+
+  function startSpeedTestPhase(phaseValue) {
+    speedTestExpectedStop = false
+    speedTestProcessStarted = false
+    speedTestPhase = phaseValue
+    speedTestStderr = ""
+    speedTestProc.command = speedTestCommandFor(phaseValue)
+    speedTestProc.running = true
+    speedTestPhaseTimer.restart()
+  }
+
+  function speedTestPhaseHasSample() {
+    return speedTestPhase === "down"
+      ? speedTestDownloadMbps !== "" : speedTestUploadMbps !== ""
+  }
+
+  function failSpeedTest(message) {
+    speedTestPhaseTimer.stop()
+    speedTestError = String(message || "Speed test failed")
+    speedTestPhase = ""
+    speedTestRunning = false
+    speedTestExpectedStop = false
+    speedTestProcessStarted = false
+  }
+
+  function finishSpeedTestPhase() {
+    if (!speedTestRunning) return
+    if (speedTestPhase === "down") {
+      startSpeedTestPhase("up")
+      return
+    }
+    speedTestPhase = ""
+    speedTestRunning = false
+    speedTestExpectedStop = false
+  }
+
+  function stopSpeedTestPhase() {
+    speedTestPhaseTimer.stop()
+    if (!speedTestRunning) return
+    if (speedTestProc.running) {
+      speedTestExpectedStop = true
+      speedTestProc.running = false
+      return
+    }
+    finishSpeedTestPhase()
+  }
+
+  function handleSpeedTestExit(exitCode) {
+    speedTestPhaseTimer.stop()
+    const expected = speedTestExpectedStop
+    speedTestExpectedStop = false
+    speedTestProcessStarted = false
+    if (speedTestPendingRun) {
+      speedTestPendingRun = false
+      speedTestRunning = false
+      if (sessionCount > 0) Qt.callLater(function() {
+        if (root.sessionCount > 0) root.runSpeedTest()
+      })
+      return
+    }
+    if (!speedTestRunning) return
+    if (!expected && exitCode !== 0) {
+      failSpeedTest(speedTestStderr || "Speed test failed")
+      return
+    }
+    if (!speedTestPhaseHasSample()) {
+      failSpeedTest(speedTestStderr || "Speed test produced no "
+        + speedTestPhase + "load data")
+      return
+    }
+    finishSpeedTestPhase()
+  }
+
+  function stopSpeedTest() {
+    const active = speedTestRunning || speedTestProc.running
+    speedTestPhaseTimer.stop()
+    speedTestPendingRun = false
+    speedTestPhase = ""
+    speedTestRunning = false
+    if (speedTestProc.running) {
+      speedTestExpectedStop = true
+      speedTestProc.running = false
+    } else {
+      speedTestExpectedStop = false
+      speedTestProcessStarted = false
+    }
+    return active
+  }
+
   function runSpeedTest() {
-    if (!ready || typeof backend.runSpeedTest !== "function"
-        || backend.speedTestRunning === true) return false
-    backend.runSpeedTest()
+    if (!ready || !speedTestReady || speedTestRunning) return false
+    speedTestError = ""
+    speedTestDownloadMbps = ""
+    speedTestUploadMbps = ""
+    if (speedTestProc.running) {
+      if (sessionCount <= 0) return false
+      speedTestPendingRun = true
+      speedTestRunning = true
+      speedTestPhase = ""
+      return true
+    }
+    speedTestPendingRun = false
+    speedTestRunning = true
+    startSpeedTestPhase("down")
     return true
   }
 
@@ -374,9 +682,64 @@ Item {
     id: bridge
     bar: root.bar
     ownerWidget: root.bar
+    networkService: root
     panelComponent: root.panelComponent
     panelSource: root.panelSource
     panelSettings: root.officialSettings()
+  }
+
+  Timer {
+    id: scanRestart
+    interval: 100
+    repeat: false
+    onTriggered: {
+      if (root.sessionCount > 0
+          && root.setSessionScannerEnabled(true)) {
+        if (root.backend && typeof root.backend.refresh === "function")
+          root.backend.refresh(false)
+        scanDone.restart()
+      } else {
+        root.scanPending = false
+      }
+    }
+  }
+
+  Timer {
+    id: scanDone
+    interval: 1500
+    repeat: false
+    onTriggered: root.completeWifiScan()
+  }
+
+  Timer {
+    id: speedTestPhaseTimer
+    interval: root.speedTestPhaseDuration
+    repeat: false
+    onTriggered: root.stopSpeedTestPhase()
+  }
+
+  Process {
+    id: speedTestProc
+    onStarted: root.speedTestProcessStarted = true
+    onRunningChanged: {
+      if (!running && root.speedTestRunning
+          && !root.speedTestProcessStarted)
+        root.failSpeedTest("Unable to start network speed test")
+    }
+    stdout: SplitParser {
+      onRead: function(line) { root.updateSpeedTestLine(line) }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.speedTestStderr = String(text || "").trim()
+        if (root.speedTestError !== "" && root.speedTestStderr !== "")
+          root.speedTestError = root.speedTestStderr
+      }
+    }
+    onExited: function(exitCode, _exitStatus) {
+      root.handleSpeedTestExit(exitCode)
+    }
   }
 
   Timer {
@@ -410,12 +773,12 @@ Item {
       + "printf '__READY__\\n'; "
       + "while IFS=: read -r uuid type; do "
       + "case \"$type\" in 802-11-wireless|wifi) ;; *) continue ;; esac; "
-      + "mapfile -t details < <(nmcli --escape no -g 802-11-wireless.ssid,connection.timestamp,802-11-wireless-security.key-mgmt connection show uuid \"$uuid\"); "
-      + "ssid=${details[0]-}; timestamp=${details[1]:-0}; key_mgmt=${details[2]:-unknown}; "
+      + "mapfile -t details < <(nmcli --escape no -g 802-11-wireless.ssid,connection.timestamp,802-11-wireless-security.key-mgmt,802-11-wireless-security.auth-alg connection show uuid \"$uuid\"); "
+      + "ssid=${details[0]-}; timestamp=${details[1]:-0}; key_mgmt=${details[2]-}; auth_alg=${details[3]-}; "
       + "[ -n \"$ssid\" ] || continue; "
       + "case \"$timestamp\" in ''|*[!0-9]*) timestamp=0 ;; esac; "
-      + "[ -n \"$key_mgmt\" ] || key_mgmt=unknown; "
-      + "printf '%s\\t%s\\t%s\\t%s\\n' \"$uuid\" \"$ssid\" \"$timestamp\" \"$key_mgmt\"; "
+      + "[ -n \"$key_mgmt\" ] || key_mgmt=open; [ -n \"$auth_alg\" ] || auth_alg=unknown; "
+      + "printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \"$uuid\" \"$ssid\" \"$timestamp\" \"$key_mgmt\" \"$auth_alg\"; "
       + "done <<< \"$connections\""]
     stdout: StdioCollector {
       waitForEnd: true
@@ -431,12 +794,13 @@ Item {
         for (let i = 1; i < lines.length; i++) {
           if (!lines[i]) continue
           const fields = lines[i].split("\t")
-          if (fields.length < 4) continue
+          if (fields.length < 5) continue
           profiles.push({
             uuid: fields[0],
-            ssid: fields.slice(1, fields.length - 2).join("\t"),
-            lastSuccessful: parseInt(fields[fields.length - 2]) || 0,
-            keyManagement: fields[fields.length - 1]
+            ssid: fields.slice(1, fields.length - 3).join("\t"),
+            lastSuccessful: parseInt(fields[fields.length - 3]) || 0,
+            keyManagement: fields[fields.length - 2],
+            authAlgorithm: fields[fields.length - 1]
           })
         }
         root.profileError = ""
@@ -465,8 +829,9 @@ Item {
 
   Component.onDestruction: {
     sessionOwners = []
+    releaseWifiScanner()
+    stopSpeedTest()
     detailsProc.running = false
     profileList.running = false
-    if (backend && backend.wifiDevice) backend.wifiDevice.scannerEnabled = false
   }
 }

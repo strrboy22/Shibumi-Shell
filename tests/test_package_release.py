@@ -26,7 +26,7 @@ class PackageReleaseTests(unittest.TestCase):
         marker = json.loads(
             (ROOT / "packaging/package-metadata.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(version, "0.1.1-beta.7")
+        self.assertEqual(version, "0.1.1-beta.8")
         self.assertEqual(suite["suiteVersion"], version)
         self.assertEqual(marker["version"], version)
         for plugin in suite["plugins"]:
@@ -72,7 +72,7 @@ class PackageReleaseTests(unittest.TestCase):
     def test_release_channel_distinguishes_prerelease_and_stable_versions(self) -> None:
         selector = ROOT / "scripts/release-channel-flag"
         for version, expected in (
-            ("0.1.1-beta.7", "--prerelease"),
+            ("0.1.1-beta.8", "--prerelease"),
             ("0.1.1-rc.1+build.7", "--prerelease"),
             ("0.1.1", "--latest"),
             ("1.0.0+build.7", "--latest"),
@@ -317,6 +317,7 @@ class PackageReleaseTests(unittest.TestCase):
                 255,
                 "gzip OS header must be independent of the Python host",
             )
+            extracted = output / "archive-root"
             with tarfile.open(archive, "r:gz") as payload:
                 names = payload.getnames()
                 private_home = b"/home/" + b"hancore/"
@@ -330,6 +331,7 @@ class PackageReleaseTests(unittest.TestCase):
                         stream.read(),
                         f"release payload exposes a private path: {member.name}",
                     )
+                payload.extractall(extracted, filter="data")
             roots = {name.split("/", 1)[0] for name in names}
             self.assertEqual(roots, {f"shibumi-shell-{inventory['version']}"})
             self.assertFalse(
@@ -344,6 +346,18 @@ class PackageReleaseTests(unittest.TestCase):
             )
             manifests = [name for name in names if name.endswith("/manifest.json")]
             self.assertEqual(len(manifests), 24)
+            boundary = subprocess.run(
+                [
+                    str(ROOT / "scripts/check-production-boundary"),
+                    "--root",
+                    str(extracted / next(iter(roots))),
+                ],
+                cwd=ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(boundary.returncode, 0, boundary.stderr)
 
 
 if __name__ == "__main__":

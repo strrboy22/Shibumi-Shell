@@ -25,6 +25,10 @@ Item {
   property string pickerProvider: "All"
   property string installUrl: ""
   property string installStatus: ""
+  readonly property string normalizedInstallUrl:
+    extractInstallUrl(installUrl)
+  readonly property bool installInputWasCommand: normalizedInstallUrl !== ""
+    && normalizedInstallUrl !== installUrl.trim()
   readonly property bool returnOnly: controller.stockOmarchyHost === true
 
   readonly property var pageOptions: {
@@ -42,7 +46,8 @@ Item {
   readonly property var settingsSearchEntries: {
     const pageKeywords = {
       bars: "bars shell omarchy shibumi switch continuity layout v1 v2 "
-        + "split gap slots divider separator full fit dock notch position "
+        + "protect protection lock split gap slots divider separator "
+        + "full fit dock notch position "
         + "surface color accent border panel tooltip",
       plugins: "widgets modules plugins add install enable disable remove "
         + "delete provider active available",
@@ -135,6 +140,15 @@ Item {
     Commons.Style.space(28) + Commons.Style.spacing.sm * 2
     + Commons.Style.space(1) + Commons.Style.space(42) * 2
     + Commons.Style.space(12) + Commons.Style.space(18)
+  readonly property bool compactBarsPage:
+    currentPage === "configure"
+    && configureDetailPage === "bars"
+    && settingsQuery.trim() === ""
+    && pageLoader.item !== null
+  readonly property real compactBarsPanelHeight:
+    configureDetailPanelChromeHeight
+    + Math.max(1, Number(pageLoader.item
+      ? pageLoader.item.implicitHeight : 1))
   readonly property bool compactIconsOverview:
     currentPage === "configure"
     && configureDetailPage === "functions"
@@ -244,8 +258,7 @@ Item {
         || String(entry.compatibility || "").toLowerCase().indexOf(needle) >= 0
     })
   }
-  readonly property bool validInstallUrl: /^(https:\/\/|ssh:\/\/|git@)[^\s]+$/i
-    .test(installUrl.trim())
+  readonly property bool validInstallUrl: normalizedInstallUrl !== ""
   readonly property var validPageIds: pageOptions.map(function(page) {
     return page.id
   }).concat(returnOnly ? ["quick"]
@@ -444,13 +457,72 @@ Item {
     Qt.callLater(function() { installInput.forceActiveFocus() })
   }
 
+  function supportedInstallUrl(value) {
+    return /^(https:\/\/|ssh:\/\/|git@)[^\s\x00-\x1f\x7f]+$/i
+      .test(String(value || ""))
+  }
+
+  function installInputTokens(value) {
+    const input = String(value || "").trim()
+    if (input === "") return []
+    const tokens = []
+    let token = ""
+    let quote = ""
+    for (let index = 0; index < input.length; index++) {
+      const character = input.charAt(index)
+      if (quote !== "") {
+        if (character === quote) quote = ""
+        else token += character
+        continue
+      }
+      if (character === "\"" || character === "'") {
+        quote = character
+      } else if (/\s/.test(character)) {
+        if (token !== "") {
+          tokens.push(token)
+          token = ""
+        }
+      } else {
+        token += character
+      }
+    }
+    if (quote !== "") return []
+    if (token !== "") tokens.push(token)
+    return tokens
+  }
+
+  function extractInstallUrl(value) {
+    const tokens = installInputTokens(value)
+    let repository = ""
+    for (let index = 0; index < tokens.length; index++) {
+      const token = tokens[index]
+      if (!supportedInstallUrl(token)) continue
+      if (repository !== "") return ""
+      repository = token
+    }
+    return repository
+  }
+
+  function normalizeInstallInput() {
+    const repository = extractInstallUrl(installUrl)
+    if (repository === "") return false
+    installUrl = repository
+    return true
+  }
+
+  function pluginInstallCommand(value) {
+    const repository = extractInstallUrl(value)
+    return repository === "" ? []
+      : ["omarchy", "plugin", "add", repository, "--yes"]
+  }
+
   function startInstall() {
-    if (!validInstallUrl || !installConfirmed || pluginInstall.running)
+    const command = pluginInstallCommand(installUrl)
+    if (command.length === 0 || !installConfirmed || pluginInstall.running)
       return false
+    installUrl = command[3]
     installStatus = "Validating and installing plugin …"
-    pluginInstall.command = [
-      "omarchy", "plugin", "add", installUrl.trim(), "--yes"
-    ]
+    pluginInstall.command = command
     pluginInstall.running = true
     return true
   }
@@ -1049,6 +1121,7 @@ Item {
               root.installConfirmed = false
               root.installStatus = ""
             }
+            onEditingFinished: root.normalizeInstallInput()
 
             Text {
               anchors.fill: parent
@@ -1335,9 +1408,12 @@ Item {
             Text {
               width: parent.width
               visible: root.installStatus !== ""
+                || root.installInputWasCommand
                 || (root.installUrl !== "" && !root.validInstallUrl)
               text: root.installStatus !== "" ? root.installStatus
-                : "Use an HTTPS, SSH, or git@ URL."
+                : root.installInputWasCommand
+                  ? "Repository detected: " + root.normalizedInstallUrl
+                  : "Use an HTTPS, SSH, or git@ URL or paste an Omarchy add command."
               color: root.installStatus.indexOf("failed") >= 0
                 ? Commons.Color.urgent : root.foreground
               opacity: 0.68

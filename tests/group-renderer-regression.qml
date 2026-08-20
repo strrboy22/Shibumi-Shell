@@ -2,28 +2,69 @@ import QtQuick
 import Quickshell
 import "core" as Core
 import "styles/shibumi" as ShibumiStyle
+import "widgets" as Widgets
 
 ShellRoot {
   Item {
     id: test
 
     width: 1200
-    height: 120
+    height: 180
     property int narrowStage: 0
 
     Component {
       id: markerWidget
 
       Item {
+        id: marker
+
         property var bar: null
         property string moduleName: ""
         property var settings: ({})
         property real availableWidth: -1
+        readonly property bool suiteNativePill:
+          [
+            "hancore.shibumi.temperature",
+            "hancore.shibumi.gpu",
+            "hancore.shibumi.storage"
+          ].indexOf(moduleName) >= 0
+        readonly property int nativeSurfaceCount: nativePillLoader.item
+          ? nativePillLoader.item.renderedSurfaceCount : 0
 
         visible: true
         implicitWidth: moduleName === "hancore.shibumi.center" ? 100
           : moduleName === "omarchy.active-window" ? 30 : 10
-        implicitHeight: 12
+        implicitHeight: suiteNativePill ? 24 : 12
+
+        Loader {
+          id: nativePillLoader
+          active: marker.suiteNativePill
+          anchors.fill: parent
+          sourceComponent: Component {
+            Widgets.PillSurface {
+              bar: marker.bar
+              tokenSource: marker.bar ? marker.bar.visualTokens : null
+              settings: marker.settings
+              v1AppearanceEnabled: true
+            }
+          }
+        }
+      }
+    }
+
+    Component {
+      id: mixedHeightExternalWidget
+
+      Item {
+        property var bar: null
+        property string moduleName: ""
+        property string hostGroupId: ""
+        property var settings: ({})
+        property real availableWidth: 0
+
+        visible: true
+        implicitWidth: 36
+        implicitHeight: bar ? bar.externalWidgetHeight : 35
       }
     }
 
@@ -71,7 +112,14 @@ ShellRoot {
       id: fakeStateService
       property int revision: 0
       property var config: ({
-        widgets: ({ G1: { widgetPadding: "compact" } })
+        widgets: ({
+          G1: { widgetPadding: "compact" },
+          "G:hancore.shibumi.temperature": {
+            color: "color01",
+            colorMode: "border",
+            surfaceOpacity: 0.4
+          }
+        })
       })
       readonly property color selectedColor: "#88aaff"
 
@@ -161,6 +209,7 @@ ShellRoot {
       property int toggleCount: 0
       property string lastToggleRegion: ""
       property int lastToggleIndex: -1
+      property bool activeLayoutProtected: false
 
       readonly property bool v2Mode: false
       readonly property var order: ({
@@ -238,8 +287,10 @@ ShellRoot {
     QtObject {
       id: v2SplitController
 
+      property bool activeLayoutProtected: false
       readonly property bool v2Mode: true
       readonly property var order: noSplitController.order
+      readonly property var splits: noSplitController.splits
 
       function splitEnabled(region, index) {
         // Deliberately active: V1 positional splits must not leak into V2.
@@ -253,6 +304,7 @@ ShellRoot {
       readonly property bool vertical: false
       readonly property int barSize: 26
       readonly property bool transparent: false
+      property bool testShadowEnabled: true
       readonly property string fontFamily: "monospace"
       readonly property color foreground: "#eeeeee"
       readonly property color background: "#181818"
@@ -274,7 +326,21 @@ ShellRoot {
         pillBorder: "#606060",
         sumi: "#aaaaaa",
         pillBorderWidth: 1,
-        islandBorder: "#505050"
+        pillShadow: "#66000000",
+        shadowEnabled: noSplitBar.testShadowEnabled,
+        islandBorder: "#505050",
+        v2Shell: false,
+        widgetHasFill: function(settings) {
+          return settings && settings.color === "color01"
+        },
+        widgetFillColor: function(settings) {
+          return settings && settings.color === "color01"
+            ? "#884422" : "transparent"
+        },
+        widgetSurfaceOpacity: function(settings) {
+          return settings && settings.surfaceOpacity !== undefined
+            ? Number(settings.surfaceOpacity) : 1
+        }
       })
       readonly property var layoutConfig: ({ left: [], center: [], right: [] })
       readonly property var layoutController: noSplitController
@@ -290,6 +356,100 @@ ShellRoot {
       function hideTooltip(owner) {}
       function releasePopout(owner) {}
       function unassignedLayoutEntries(region) { return [] }
+    }
+
+    QtObject {
+      id: tallAlignmentBar
+
+      property bool useV2: false
+      property string position: "top"
+      readonly property int externalWidgetHeight: 35
+      readonly property bool vertical: false
+      readonly property int barSize: useV2 ? 33 : 35
+      readonly property bool transparent: false
+      readonly property string fontFamily: "monospace"
+      readonly property color foreground: noSplitBar.foreground
+      readonly property color barForeground: noSplitBar.foreground
+      readonly property color background: noSplitBar.background
+      readonly property color urgent: noSplitBar.urgent
+      readonly property bool foregroundAnimationEnabled: false
+      readonly property var shell: fakeShell
+      readonly property var visualTokens: useV2
+        ? v2SplitBar.visualTokens : noSplitBar.visualTokens
+      readonly property var layoutConfig: ({
+        left: [{ id: "custom.tall-left" }],
+        center: [{ id: "custom.tall-center" }],
+        right: [{ id: "custom.tall-right" }]
+      })
+      readonly property var layoutController: useV2
+        ? v2SplitController : noSplitController
+      readonly property var pluginRegistry: ({ installedPlugins: ({}) })
+      property var activePopout: null
+      property var pendingTooltipTarget: null
+      property var tooltipTarget: null
+
+      function entryId(entry) { return noSplitBar.entryId(entry) }
+      function entrySettings(entry) { return noSplitBar.entrySettings(entry) }
+      function registeredWidgetComponent(moduleName) {
+        return String(moduleName || "").indexOf("custom.tall-") === 0
+          ? mixedHeightExternalWidget
+          : fakeWidgetRegistry.componentFor(moduleName)
+      }
+      function registerModuleSlot(_slot) {}
+      function unregisterModuleSlot(_slot) {}
+      function showTooltip(_owner, _text) {}
+      function hideTooltip(_owner) {}
+      function releasePopout(_owner) {}
+      function unassignedLayoutEntries(region) {
+        return layoutConfig[String(region || "")] || []
+      }
+    }
+
+    QtObject {
+      id: shortAlignmentBar
+
+      property bool useV2: false
+      property string position: "top"
+      readonly property int externalWidgetHeight: 8
+      readonly property bool vertical: false
+      readonly property int barSize: useV2 ? 33 : 35
+      readonly property bool transparent: false
+      readonly property string fontFamily: "monospace"
+      readonly property color foreground: noSplitBar.foreground
+      readonly property color barForeground: noSplitBar.foreground
+      readonly property color background: noSplitBar.background
+      readonly property color urgent: noSplitBar.urgent
+      readonly property bool foregroundAnimationEnabled: false
+      readonly property var shell: fakeShell
+      readonly property var visualTokens: useV2
+        ? v2SplitBar.visualTokens : noSplitBar.visualTokens
+      readonly property var layoutConfig: ({
+        left: [{ id: "custom.short-left" }],
+        center: [{ id: "custom.short-center" }],
+        right: [{ id: "custom.short-right" }]
+      })
+      readonly property var layoutController: useV2
+        ? v2SplitController : noSplitController
+      readonly property var pluginRegistry: ({ installedPlugins: ({}) })
+      property var activePopout: null
+      property var pendingTooltipTarget: null
+      property var tooltipTarget: null
+
+      function entryId(entry) { return noSplitBar.entryId(entry) }
+      function entrySettings(entry) { return noSplitBar.entrySettings(entry) }
+      function registeredWidgetComponent(moduleName) {
+        return String(moduleName || "").indexOf("custom.short-") === 0
+          ? mixedHeightExternalWidget
+          : fakeWidgetRegistry.componentFor(moduleName)
+      }
+      function registerModuleSlot(_slot) {}
+      function unregisterModuleSlot(_slot) {}
+      function showTooltip(_owner, _text) {}
+      function hideTooltip(_owner) {}
+      function releasePopout(_owner) {}
+      function unassignedLayoutEntries(region) {
+        return layoutConfig[String(region || "")] || []
+      }
     }
 
     QtObject {
@@ -332,6 +492,12 @@ ShellRoot {
       readonly property color urgent: noSplitBar.urgent
       readonly property var shell: fakeShell
       readonly property var visualTokens: ({
+        shellStyle: "full",
+        shellWingWidth: 14,
+        shellFitRadius: 6,
+        shellDockRadius: 8,
+        shellBorder: "#505050",
+        shellShadow: "#66000000",
         islandRadius: 16,
         islandHeight: 32,
         islandInsetX: 5,
@@ -345,7 +511,11 @@ ShellRoot {
         separator: "#555555",
         pillHeight: 24,
         pillBorderWidth: 1,
+        pillShadow: "#66000000",
+        shadowEnabled: true,
         islandBorder: "#505050",
+        slotHeight: 28,
+        tileRadius: 10,
         v2Shell: true,
         widgetHasFill: function(settings) {
           return settings && settings.color === "color01"
@@ -359,7 +529,10 @@ ShellRoot {
         widgetSurfaceOpacity: function(settings) { return 1 },
         widgetRadius: function(settings) { return 10 }
       })
-      readonly property var layoutConfig: noSplitBar.layoutConfig
+      readonly property var layoutConfig: ({
+        left: [], center: [],
+        right: [{ id: "omarchy.active-window" }]
+      })
       readonly property var layoutController: v2SplitController
       property var activePopout: null
       property int separatorToggles: 0
@@ -452,7 +625,11 @@ ShellRoot {
       readonly property var visualTokens: noSplitBar.visualTokens
       readonly property var layoutConfig: ({
         left: [], center: [],
-        right: [{ id: "omarchy.active-window" }]
+        right: [
+          { id: "omarchy.active-window" },
+          { id: "hancore.shibumi.temperature" },
+          { id: "hancore.shibumi.gpu" }
+        ]
       })
       property var activePopout: null
 
@@ -595,6 +772,7 @@ ShellRoot {
       id: v2LeftWithSplit
       bar: v2SplitBar
       region: "left"
+      layoutSession: editingSession
     }
 
     ShibumiStyle.GroupSection {
@@ -643,6 +821,22 @@ ShellRoot {
       y: 50
     }
 
+    ShibumiStyle.BarSurface {
+      id: tallAlignmentSurface
+      bar: tallAlignmentBar
+      width: 1200
+      height: tallAlignmentBar.barSize
+      y: 80
+    }
+
+    ShibumiStyle.BarSurface {
+      id: shortAlignmentSurface
+      bar: shortAlignmentBar
+      width: 1200
+      height: shortAlignmentBar.barSize
+      y: 120
+    }
+
     Core.WidgetSlot {
       id: directWidget
       bar: noSplitBar
@@ -669,9 +863,27 @@ ShellRoot {
     }
 
     Core.GroupSlot {
+      id: dynamicSuiteV1FillGroup
+      bar: budgetBar
+      groupId: "G:hancore.shibumi.temperature"
+    }
+
+    Core.GroupSlot {
+      id: dynamicSuiteV1InheritedGroup
+      bar: budgetBar
+      groupId: "G:hancore.shibumi.gpu"
+    }
+
+    Core.GroupSlot {
       id: v2FillGroup
       bar: v2SplitBar
       groupId: "G1"
+    }
+
+    Core.GroupSlot {
+      id: dynamicV2Group
+      bar: v2SplitBar
+      groupId: "G:omarchy.active-window"
     }
 
     Core.GroupSlot {
@@ -727,6 +939,63 @@ ShellRoot {
       return result
     }
 
+    function regionItem(item, region) {
+      if (!item) return null
+      if ("region" in item && "contentItem" in item
+          && String(item.region || "") === region) return item
+      const children = item.children || []
+      for (const child of children) {
+        const match = regionItem(child, region)
+        if (match) return match
+      }
+      return null
+    }
+
+    function centerY(item, relativeTo) {
+      const point = item.mapToItem(relativeTo, 0, 0)
+      return point.y + item.height / 2
+    }
+
+    function regionAlignmentError(surface, alignmentTestBar, region,
+        expectedV2, expectedPosition, expectedExtraHeight) {
+      const groups = regionItem(surface, region)
+      const extras = regionItem(surface, region + "-extra")
+      if (!groups || !extras || groups.implicitWidth <= 0
+          || extras.implicitWidth <= 0)
+        return region + " region did not load"
+      if (alignmentTestBar.useV2 !== expectedV2
+          || groups.v2Mode !== expectedV2)
+        return region + " region did not enter "
+          + (expectedV2 ? "V2" : "V1")
+      if (alignmentTestBar.position !== expectedPosition)
+        return region + " region did not enter " + expectedPosition
+      if (!closeEnough(extras.implicitHeight, expectedExtraHeight)
+          || closeEnough(extras.implicitHeight, groups.implicitHeight))
+        return region + " fixture lost its mixed-height precondition: groups="
+          + groups.implicitHeight + ", extras=" + extras.implicitHeight
+          + ", expected extra=" + expectedExtraHeight
+      const groupCenter = centerY(groups, surface)
+      const extraCenter = centerY(extras, surface)
+      const shibumiShell = String(
+        alignmentTestBar.visualTokens.shellStyle || "shibumi") === "shibumi"
+      const chromeHeight = shibumiShell
+        ? Math.min(surface.height,
+            alignmentTestBar.visualTokens.islandHeight)
+        : surface.height
+      const chromeY = shibumiShell
+        ? expectedPosition === "bottom" ? 0
+          : alignmentTestBar.visualTokens.islandOffsetY
+        : expectedPosition === "bottom"
+          ? surface.height - chromeHeight : 0
+      const expectedCenter = chromeY + chromeHeight / 2
+      if (!closeEnough(groupCenter, extraCenter)
+          || !closeEnough(groupCenter, expectedCenter))
+        return region + " centers differ: groups=" + groupCenter
+          + ", extras=" + extraCenter + ", expected=" + expectedCenter
+          + ", heights=" + groups.height + "/" + extras.height
+      return ""
+    }
+
     function sectionState(section) {
       const result = []
       const children = section && section.contentItem
@@ -756,7 +1025,29 @@ ShellRoot {
       property int separatorPhase: 0
       property real separatorBaseWidth: 0
       property int shapePhase: 0
+      property int shadowPhase: 0
       property int hiddenGapPhase: 0
+      property int alignmentPhase: 0
+      readonly property var alignmentCases: [
+        { v2: false, position: "top" },
+        { v2: false, position: "bottom" },
+        { v2: true, position: "top" },
+        { v2: true, position: "bottom" }
+      ]
+      readonly property var alignmentFixtures: [
+        {
+          name: "tall",
+          surface: tallAlignmentSurface,
+          bar: tallAlignmentBar,
+          extraHeight: 35
+        },
+        {
+          name: "short",
+          surface: shortAlignmentSurface,
+          bar: shortAlignmentBar,
+          extraHeight: 8
+        }
+      ]
 
       interval: 10
       running: true
@@ -793,6 +1084,38 @@ ShellRoot {
             + ", childWidth="
             + (directGroup.contentItem ? directGroup.contentItem.childrenRect.width : -1))
           return
+        }
+
+        if (alignmentPhase < alignmentCases.length) {
+          const alignmentCase = alignmentCases[alignmentPhase]
+          for (const fixture of alignmentFixtures) {
+            for (const region of ["left", "center", "right"]) {
+              const alignmentError = test.regionAlignmentError(
+                fixture.surface, fixture.bar, region, alignmentCase.v2,
+                alignmentCase.position, fixture.extraHeight)
+              if (alignmentError !== "") {
+                if (attempts < 50) return
+                stop()
+                test.fail("mixed-height extra shifted grouped widgets in "
+                  + (alignmentCase.v2 ? "V2" : "V1") + " "
+                  + alignmentCase.position + " with " + fixture.name
+                  + " " + fixture.extraHeight + "px extra: "
+                  + alignmentError)
+                return
+              }
+            }
+          }
+          alignmentPhase++
+          if (alignmentPhase < alignmentCases.length) {
+            const nextAlignmentCase = alignmentCases[alignmentPhase]
+            tallAlignmentBar.useV2 = nextAlignmentCase.v2
+            tallAlignmentBar.position = nextAlignmentCase.position
+            shortAlignmentBar.useV2 = nextAlignmentCase.v2
+            shortAlignmentBar.position = nextAlignmentCase.position
+            attempts = 0
+            return
+          }
+          attempts = 0
         }
 
         if (hiddenGapPhase === 0) {
@@ -983,6 +1306,65 @@ ShellRoot {
           return
         }
 
+        if (shadowPhase === 0) {
+          const dynamicV2Slots = test.widgetSlots(
+            dynamicV2Group.contentItem, [])
+          if (dynamicV2Group.moduleCount !== 1
+              || !dynamicV2Group.contentItem
+              || dynamicV2Slots.length !== 1
+              || !dynamicV2Slots[0].activeItem) {
+            if (attempts < 50) return
+            stop()
+            test.fail("dynamic V2 external widget did not load: modules="
+              + dynamicV2Group.moduleCount + ", content="
+              + dynamicV2Group.contentItem + ", slots="
+              + dynamicV2Slots.length)
+            return
+          }
+          if (!dynamicV1Group.dynamicShadowLoaded) {
+            if (attempts < 50) return
+            stop()
+            test.fail("dynamic V1 shadow did not load before lifecycle toggle")
+            return
+          }
+          if (dynamicV2Group.dynamicShadowLoaded) {
+            stop()
+            test.fail("dynamic V2 group loaded a V1 pill shadow")
+            return
+          }
+          noSplitBar.testShadowEnabled = false
+          shadowPhase = 1
+          attempts = 0
+          return
+        }
+        if (shadowPhase === 1) {
+          if (dynamicV1Group.dynamicShadowLoaded) {
+            if (attempts < 50) return
+            stop()
+            test.fail("dynamic V1 shadow did not unload when disabled")
+            return
+          }
+          noSplitBar.testShadowEnabled = true
+          shadowPhase = 2
+          attempts = 0
+          return
+        }
+        if (shadowPhase === 2) {
+          if (!dynamicV1Group.dynamicShadowLoaded) {
+            if (attempts < 50) return
+            stop()
+            test.fail("dynamic V1 shadow did not reload when re-enabled")
+            return
+          }
+          if (dynamicV2Group.dynamicShadowLoaded) {
+            stop()
+            test.fail("dynamic V2 group loaded a V1 pill shadow after toggle")
+            return
+          }
+          shadowPhase = 3
+          attempts = 0
+        }
+
         stop()
         const spacing = leftWithoutSplit.groupSpacing
         const expectedLeft = 70 + 6 * spacing
@@ -997,7 +1379,9 @@ ShellRoot {
           return
         }
         if (leftWithSplit.persistentSeparators
-            || !v2LeftWithSplit.persistentSeparators) {
+            || !v2LeftWithSplit.persistentSeparators
+            || leftWithoutSplit.enabledSeparatorHitTargetCount !== 6
+            || v2LeftWithSplit.enabledSeparatorHitTargetCount !== 6) {
           test.fail("separator visibility must stay transient in Shibumi"
             + " and persist in V2 shell styles")
           return
@@ -1005,7 +1389,14 @@ ShellRoot {
         const separatorBeforeFill = v2LeftWithSplit.separatorGeometry.find(
           function(entry) { return entry.groupId === "G1" })
         fakeStateService.config = ({
-          widgets: ({ G1: { color: "color01" } })
+          widgets: ({
+            G1: { color: "color01" },
+            "G:hancore.shibumi.temperature": {
+              color: "color01",
+              colorMode: "border",
+              surfaceOpacity: 0.4
+            }
+          })
         })
         const separatorAfterFill = v2LeftWithSplit.separatorGeometry.find(
           function(entry) { return entry.groupId === "G1" })
@@ -1041,6 +1432,30 @@ ShellRoot {
           test.fail("live V1 splits and persistent V2 separators diverged")
           return
         }
+        noSplitController.activeLayoutProtected = true
+        v2SplitController.activeLayoutProtected = true
+        if (leftWithoutSplit.separatorChangesAllowed
+            || v2LeftWithSplit.separatorChangesAllowed
+            || leftWithoutSplit.enabledSeparatorHitTargetCount !== 6
+            || v2LeftWithSplit.enabledSeparatorHitTargetCount !== 6
+            || leftWithoutSplit.toggleSeparator("G1", 0)
+            || v2LeftWithSplit.toggleSeparator("G1", 0)
+            || noSplitController.toggleCount !== 1
+            || v2SplitBar.separatorToggles !== 1) {
+          test.fail("protected layouts accepted direct separator changes")
+          return
+        }
+        editingSession.editing = true
+        if (!leftWithoutSplit.separatorChangesAllowed
+            || !v2LeftWithSplit.separatorChangesAllowed
+            || !leftWithoutSplit.toggleSeparator("G1", 0)
+            || !v2LeftWithSplit.toggleSeparator("G1", 0)
+            || noSplitController.toggleCount !== 2
+            || v2SplitBar.separatorToggles !== 2) {
+          test.fail("edit mode did not override V1/V2 layout protection")
+          return
+        }
+        editingSession.editing = false
 
         if (!test.closeEnough(leftWithoutSplit.implicitWidth, expectedLeft)) {
           test.fail("left group composition: got "
@@ -1097,6 +1512,7 @@ ShellRoot {
           return
         }
         if (!dynamicV1Group.dynamicV1Group
+            || dynamicV1Group.dynamicV1CustomFill
             || !dynamicV1Group.visualSurfaceItem.visible
             || !test.closeEnough(dynamicV1Group.visualSurfaceItem.height, 24)
             || !test.closeEnough(dynamicV1Group.visualSurfaceItem.radius, 12)
@@ -1105,6 +1521,59 @@ ShellRoot {
             + dynamicV1Group.visualSurfaceItem.height + ", radius="
             + dynamicV1Group.visualSurfaceItem.radius + ", border="
             + dynamicV1Group.visualSurfaceItem.border.width)
+          return
+        }
+        if (directGroup.dynamicShadowLoaded !== false
+            || dynamicV1Group.dynamicShadowLoaded !== true
+            || dynamicSuiteV1FillGroup.dynamicShadowLoaded !== false
+            || dynamicSuiteV1InheritedGroup.dynamicShadowLoaded !== false
+            || v2FillGroup.dynamicShadowLoaded !== false
+            || dynamicV2Group.dynamicShadowLoaded !== false) {
+          test.fail("dynamic V1 shadow lifecycle is not load-gated: fixed="
+            + directGroup.dynamicShadowLoaded + ", external="
+            + dynamicV1Group.dynamicShadowLoaded + ", suiteFill="
+            + dynamicSuiteV1FillGroup.dynamicShadowLoaded
+            + ", suiteInherited="
+            + dynamicSuiteV1InheritedGroup.dynamicShadowLoaded + ", v2="
+            + v2FillGroup.dynamicShadowLoaded + ", dynamicV2="
+            + dynamicV2Group.dynamicShadowLoaded)
+          return
+        }
+        const dynamicFillSlots = test.widgetSlots(
+          dynamicSuiteV1FillGroup.contentItem, [])
+        const dynamicInheritedSlots = test.widgetSlots(
+          dynamicSuiteV1InheritedGroup.contentItem, [])
+        if (!dynamicSuiteV1FillGroup.dynamicV1Group
+            || !dynamicSuiteV1FillGroup.dynamicV1WidgetOwnsSurface
+            || !dynamicSuiteV1FillGroup.dynamicV1CustomFill
+            || dynamicSuiteV1FillGroup.visualSurfaceItem.visible
+            || dynamicFillSlots.length !== 1
+            || !dynamicFillSlots[0].activeItem
+            || dynamicFillSlots[0].activeItem.nativeSurfaceCount !== 1
+            || !dynamicSuiteV1InheritedGroup.dynamicV1Group
+            || !dynamicSuiteV1InheritedGroup.dynamicV1WidgetOwnsSurface
+            || dynamicSuiteV1InheritedGroup.dynamicV1CustomFill
+            || dynamicSuiteV1InheritedGroup.visualSurfaceItem.visible
+            || dynamicInheritedSlots.length !== 1
+            || !dynamicInheritedSlots[0].activeItem
+            || dynamicInheritedSlots[0].activeItem.nativeSurfaceCount !== 1) {
+          test.fail("suite-native dynamic V1 surface ownership drifted: custom="
+            + JSON.stringify({
+              owns: dynamicSuiteV1FillGroup.dynamicV1WidgetOwnsSurface,
+              fill: dynamicSuiteV1FillGroup.dynamicV1CustomFill,
+              wrapper: dynamicSuiteV1FillGroup.visualSurfaceItem.visible,
+              slots: dynamicFillSlots.length,
+              native: dynamicFillSlots[0] && dynamicFillSlots[0].activeItem
+                ? dynamicFillSlots[0].activeItem.nativeSurfaceCount : -1
+            }) + ", inherited=" + JSON.stringify({
+              owns: dynamicSuiteV1InheritedGroup.dynamicV1WidgetOwnsSurface,
+              fill: dynamicSuiteV1InheritedGroup.dynamicV1CustomFill,
+              wrapper: dynamicSuiteV1InheritedGroup.visualSurfaceItem.visible,
+              slots: dynamicInheritedSlots.length,
+              native: dynamicInheritedSlots[0]
+                  && dynamicInheritedSlots[0].activeItem
+                ? dynamicInheritedSlots[0].activeItem.nativeSurfaceCount : -1
+            }))
           return
         }
         if (!test.closeEnough(delayedGroup.implicitWidth, 42)

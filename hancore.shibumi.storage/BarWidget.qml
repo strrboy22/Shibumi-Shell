@@ -31,6 +31,13 @@ Ui.Panel {
     : (bar ? bar.urgent : Commons.Color.accent)
   readonly property string displayMode: String(
     setting("displayMode", setting("compact", false) ? "icon" : "full"))
+  readonly property bool compact: displayMode === "icon"
+  readonly property bool valueVisible: displayMode !== "icon"
+  readonly property int iconSlotSize: 14
+  // The Nerd Font storage glyph overhangs its advance box on the right.
+  readonly property int compactIconOpticalOffset: compact
+    && tokens.v2Shell !== true
+    ? -Math.max(1, Math.round(Number(tokens.iconSize) / 18)) : 0
   readonly property string configuredSource: String(setting("source", "root"))
   readonly property var selectedDrive: driveForSource(configuredSource)
   readonly property string selectedSource:
@@ -100,7 +107,8 @@ Ui.Panel {
   Item {
     id: surface
     anchors.centerIn: parent
-    implicitWidth: content.implicitWidth + 2 * root.tokens.pillPaddingX
+    implicitWidth: content.visibleContentWidth
+      + 2 * root.tokens.pillPaddingX
     implicitHeight: root.tokens ? root.tokens.slotHeight : 28
     width: implicitWidth
     height: implicitHeight
@@ -109,6 +117,7 @@ Ui.Panel {
       tokenSource: root.tokens
       bar: root.bar
       settings: root.settings
+      v1AppearanceEnabled: true
       anchors.fill: parent
       anchors.topMargin: Math.round(
         (parent.height - root.tokens.pillHeight) / 2)
@@ -119,21 +128,38 @@ Ui.Panel {
     Row {
       id: content
       anchors.centerIn: parent
-      spacing: root.tokens.compactGap
+      anchors.horizontalCenterOffset: root.compactIconOpticalOffset
+      readonly property real visibleContentWidth:
+        (storageIconSlot.visible ? storageIconSlot.width : 0)
+        + (storageValue.visible ? storageValue.implicitWidth : 0)
+        + spacing
+      width: visibleContentWidth
+      spacing: storageIconSlot.visible && storageValue.visible
+        ? root.tokens.compactGap : 0
 
-      Text {
+      Item {
+        id: storageIconSlot
         visible: root.displayMode !== "text"
+        width: visible ? root.iconSlotSize : 0
+        height: root.iconSlotSize
         anchors.verticalCenter: parent.verticalCenter
-        text: "󰋊"
-        color: root.widgetInk
-        font.family: root.bar ? root.bar.fontFamily : Commons.Style.font.family
-        font.pixelSize: root.tokens.iconSize
-        horizontalAlignment: Text.AlignHCenter
-        renderType: Text.NativeRendering
+
+        Text {
+          id: storageIcon
+          anchors.centerIn: parent
+          text: "󰋊"
+          color: root.widgetInk
+          font.family: root.bar ? root.bar.fontFamily : Commons.Style.font.family
+          font.pixelSize: root.tokens.iconSize
+          horizontalAlignment: Text.AlignHCenter
+          renderType: Text.NativeRendering
+        }
       }
 
       Text {
-        visible: root.displayMode !== "icon"
+        id: storageValue
+        visible: root.valueVisible
+        width: visible ? implicitWidth : 0
         anchors.verticalCenter: parent.verticalCenter
         text: String(Math.min(100, root.selectedPercent)).padStart(2, "0") + "%"
         color: root.widgetInk
